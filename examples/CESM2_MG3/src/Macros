@@ -1,0 +1,40 @@
+# Conditional Makefile macros for this kernel & version:
+
+# User settings (all case-insensitive):
+COMPILER = pgi
+MPI      = no          # Yes/No, True/False or Enabled/Disabled
+DEBUG    = no
+
+# ********************************************************************* #
+# Provide system aliases that MIGHT need to be modified by the end user #
+MPIFC = mpif90         # Could be mpif90 (default), or mpiifort, etc
+
+# Convert all above vars to lower case:
+COMPILER := $(shell echo ${COMPILER} | tr '[:upper:]' '[:lower:]')
+MPI      := $(shell echo ${MPI}      | tr '[:upper:]' '[:lower:]')
+
+# Zero out our key variables:
+FC :=
+FC_FLAGS :=
+LD_FLAGS :=
+
+# Convert all 'true' MPI answers to 'yes', otherwise no
+ifeq ($(MPI),true)
+  MPI := yes
+else ifeq ($(MPI),enabled)
+  MPI := yes
+endif
+
+ifeq ($(DEBUG),true)
+  DEBUG := yes
+else ifeq ($(DEBUG),enabled)
+  DEBUG := yes
+endif
+
+# ********* PGI compiler options  ************
+ifeq ($(COMPILER), pgi)
+  FC := pgf90
+#  FC_FLAGS += -O -tp=skylake -acc -Minfo=accel -ta=tesla:cc70,lineinfo -D__OPENACC__
+  FC_FLAGS += -O -tp=skylake -L/glade/u/apps/dav/opt/netcdf/4.7.4/pgi/20.4/lib -lnetcdff -lnetcdf
+  LD_FLAGS += $(FC_FLAGS) -L/glade/u/apps/dav/opt/cuda/11.0.3/lib64 -lnvToolsExt -lcudart -L/glade/u/apps/dav/opt/netcdf/4.7.4/pgi/20.4/lib -lnetcdff -lnetcdf
+endif

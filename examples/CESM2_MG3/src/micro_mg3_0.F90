@@ -1,0 +1,4252 @@
+#define VLEN 128
+
+module micro_mg3_0
+!---------------------------------------------------------------------------------
+! Purpose:
+!   MG microphysics version 3.0 - Update of MG microphysics with
+!                                 prognostic hail OR graupel.
+!
+! Author: Andrew Gettelman, Hugh Morrison
+!
+! Version 3 history: Sep 2016: development begun for hail, graupel 
+!
+! Version 2 history: Sep 2011: Development begun.
+!                    Feb 2013: Added of prognostic precipitation.
+!                    Aug 2015: Published and released version
+! Contributions from:  Sean Santos, Peter Caldwell, Xiaohong Liu and Steve Ghan
+!
+! invoked in CAM by specifying -microphys=mg3
+!
+! References: 
+!
+!           Gettelman, A. and H. Morrison, Advanced Two-Moment Microphysics for Global Models. 
+!
+!           Part I: Off line tests and comparisons with other schemes. 
+!
+!           J. Climate, 28, 1268-1287. doi: 10.1175/JCLI-D-14-00102.1, 2015. 
+!
+!
+!
+!           Gettelman, A., H. Morrison, S. Santos, P. Bogenschutz and P. H. Caldwell 
+!
+!           Advanced Two-Moment Microphysics for Global Models. 
+!
+!           Part II: Global model solutions and Aerosol-Cloud Interactions. 
+!
+!           J. Climate, 28, 1288-1307. doi:10.1175/JCLI-D-14-00103.1 , 2015. 
+!
+! for questions contact Hugh Morrison, Andrew Gettelman
+! e-mail: morrison@ucar.edu, andrew@ucar.edu
+!---------------------------------------------------------------------------------
+!
+! NOTE: Modified to allow other microphysics packages (e.g. CARMA) to do ice
+! microphysics in cooperation with the MG liquid microphysics. This is
+! controlled by the do_cldice variable.
+!
+! If do_cldice is false, then MG microphysics should not update CLDICE or
+! NUMICE; it is assumed that the other microphysics scheme will have updated
+! CLDICE and NUMICE. The other microphysics should handle the following
+! processes that would have been done by MG:
+!   - Detrainment (liquid and ice)
+!   - Homogeneous ice nucleation
+!   - Heterogeneous ice nucleation
+!   - Bergeron process
+!   - Melting of ice
+!   - Freezing of cloud drops
+!   - Autoconversion (ice -> snow)
+!   - Growth/Sublimation of ice
+!   - Sedimentation of ice
+!
+! This option has not been updated since the introduction of prognostic
+! precipitation, and probably should be adjusted to cover snow as well.
+!
+!---------------------------------------------------------------------------------
+! Version 3.O based on micro_mg2_0.F90 and WRF3.8.1 module_mp_morr_two_moment.F
+!---------------------------------------------------------------------------------
+! Based on micro_mg (restructuring of former cldwat2m_micro)
+! Author: Andrew Gettelman, Hugh Morrison.
+! Contributions from: Xiaohong Liu and Steve Ghan
+! December 2005-May 2010
+! Description in: Morrison and Gettelman, 2008. J. Climate (MG2008)
+!                 Gettelman et al., 2010 J. Geophys. Res. - Atmospheres (G2010)
+! for questions contact Hugh Morrison, Andrew Gettelman
+! e-mail: morrison@ucar.edu, andrew@ucar.edu
+!---------------------------------------------------------------------------------
+! Code comments added by HM, 093011
+! General code structure:
+!
+! Code is divided into two main subroutines:
+!   subroutine micro_mg_init --> initializes microphysics routine, should be called
+!                                  once at start of simulation
+!   subroutine micro_mg_tend --> main microphysics routine to be called each time step
+!                                this also calls several smaller subroutines to calculate
+!                                microphysical processes and other utilities
+!
+! List of external functions:
+!   qsat_water --> for calculating saturation vapor pressure with respect to liquid water
+!   qsat_ice --> for calculating saturation vapor pressure with respect to ice
+!   gamma   --> standard mathematical gamma function
+! .........................................................................
+! List of inputs through use statement in fortran90:
+! Variable Name                      Description                Units
+! .........................................................................
+! gravit          acceleration due to gravity                    m s-2
+! rair            dry air gas constant for air                  J kg-1 K-1
+! tmelt           temperature of melting point for water          K
+! cpair           specific heat at constant pressure for dry air J kg-1 K-1
+! rh2o            gas constant for water vapor                  J kg-1 K-1
+! latvap          latent heat of vaporization                   J kg-1
+! latice          latent heat of fusion                         J kg-1
+! qsat_water      external function for calculating liquid water
+!                 saturation vapor pressure/humidity              -
+! qsat_ice        external function for calculating ice
+!                 saturation vapor pressure/humidity              pa
+! rhmini          relative humidity threshold parameter for
+!                 nucleating ice                                  -
+! .........................................................................
+! NOTE: List of all inputs/outputs passed through the call/subroutine statement
+!       for micro_mg_tend is given below at the start of subroutine micro_mg_tend.
+!---------------------------------------------------------------------------------
+
+! Procedures required:
+! 1) An implementation of the gamma function (if not intrinsic).
+! 2) saturation vapor pressure and specific humidity over water
+! 3) svp over ice
+
+#ifndef HAVE_GAMMA_INTRINSICS
+use shr_spfn_mod, only: gamma => shr_spfn_gamma
+#endif
+
+use wv_sat_methods, only: &
+     qsat_water => wv_sat_qsat_water_vect, &
+     qsat_ice => wv_sat_qsat_ice_vect
+
+! Parameters from the utilities module.
+use micro_mg_utils, only: &
+     r8, &
+     pi, &
+     omsm, &
+     qsmall, &
+     mincld, &
+     rhosn, &
+     rhoi, &
+     rhow, &
+     rhows, &
+     ac, bc, &
+     ai, bi, &
+     aj, bj, &
+     ar, br, &
+     as, bs, &
+     ag, bg, &
+     ah, bh, &
+     rhog,rhoh, &
+     mi0, &
+     rising_factorial
+
+implicit none
+private
+save
+
+public :: &
+     micro_mg_init, &
+     micro_mg_get_cols, &
+     micro_mg_tend
+
+! Switches for specification rather than prediction of droplet and crystal number
+! note: number will be adjusted as needed to keep mean size within bounds,
+! even when specified droplet or ice number is used
+!
+! If constant cloud ice number is set (nicons = .true.),
+! then all microphysical processes except mass transfer due to ice nucleation
+! (mnuccd) are based on the fixed cloud ice number. Calculation of
+! mnuccd follows from the prognosed ice crystal number ni.
+
+logical :: nccons ! nccons = .true. to specify constant cloud droplet number
+logical :: nicons ! nicons = .true. to specify constant cloud ice number
+logical :: ngcons = .false. ! ngcons = .true. to specify constant graupel number
+
+! specified ice and droplet number concentrations
+! note: these are local in-cloud values, not grid-mean
+real(r8) :: ncnst  ! droplet num concentration when nccons=.true. (m-3)
+real(r8) :: ninst  ! ice num concentration when nicons=.true. (m-3)
+real(r8) :: ngnst = 0.1e6_r8  ! graupel num concentration when ngcons=.true. (m-3)
+
+!=========================================================
+! Private module parameters
+!=========================================================
+
+!Range of cloudsat reflectivities (dBz) for analytic simulator
+real(r8), parameter :: csmin = -30._r8
+real(r8), parameter :: csmax = 26._r8
+real(r8), parameter :: mindbz = -99._r8
+real(r8), parameter :: minrefl = 1.26e-10_r8    ! minrefl = 10._r8**(mindbz/10._r8)
+
+integer, parameter ::   MG_PRECIP_FRAC_INCLOUD = 101
+integer, parameter ::   MG_PRECIP_FRAC_OVERLAP = 102
+
+! autoconversion size threshold for cloud ice to snow (m)
+real(r8) :: dcs
+
+! minimum mass of new crystal due to freezing of cloud droplets done
+! externally (kg)
+real(r8), parameter :: mi0l_min = 4._r8/3._r8*pi*rhow*(4.e-6_r8)**3
+
+! Ice number sublimation parameter. Assume some decrease in ice number with sublimation if non-zero. Else, no decrease in number with sublimation. 
+  real(r8), parameter :: sublim_factor =0.0_r8      !number sublimation factor. 
+
+!=========================================================
+! Constants set in initialization
+!=========================================================
+
+! Set using arguments to micro_mg_init
+real(r8) :: g           ! gravity
+real(r8) :: r           ! dry air gas constant
+real(r8) :: rv          ! water vapor gas constant
+real(r8) :: cpp         ! specific heat of dry air
+real(r8) :: tmelt       ! freezing point of water (K)
+
+! latent heats of:
+real(r8) :: xxlv        ! vaporization
+real(r8) :: xlf         ! freezing
+real(r8) :: xxls        ! sublimation
+
+real(r8) :: rhmini      ! Minimum rh for ice cloud fraction > 0.
+
+! flags
+logical :: microp_uniform
+logical :: do_cldice
+logical :: use_hetfrz_classnuc
+logical :: do_hail
+logical :: do_graupel
+
+real(r8) :: rhosu       ! typical 850mn air density
+
+real(r8) :: icenuct     ! ice nucleation temperature: currently -5 degrees C
+
+real(r8) :: snowmelt    ! what temp to melt all snow: currently 2 degrees C
+real(r8) :: rainfrze    ! what temp to freeze all rain: currently -5 degrees C
+
+! additional constants to help speed up code
+real(r8) :: gamma_br_plus1
+real(r8) :: gamma_br_plus4
+real(r8) :: gamma_bs_plus1
+real(r8) :: gamma_bs_plus4
+real(r8) :: gamma_bi_plus1
+real(r8) :: gamma_bi_plus4
+real(r8) :: gamma_bj_plus1
+real(r8) :: gamma_bj_plus4
+real(r8) :: gamma_bg_plus1
+real(r8) :: gamma_bg_plus4
+real(r8) :: xxlv_squared
+real(r8) :: xxls_squared
+
+character(len=16)  :: micro_mg_precip_frac_method  ! type of precipitation fraction method
+real(r8)           :: micro_mg_berg_eff_factor     ! berg efficiency factor
+
+logical  :: allow_sed_supersat ! Allow supersaturated conditions after sedimentation loop
+logical  :: do_sb_physics ! do SB 2001 autoconversion or accretion physics
+
+!===============================================================================
+contains
+!===============================================================================
+
+subroutine micro_mg_init( &
+     kind, gravit, rair, rh2o, cpair,    &
+     tmelt_in, latvap, latice,           &
+     rhmini_in, micro_mg_dcs,            &
+     micro_mg_do_hail_in,micro_mg_do_graupel_in, &
+     microp_uniform_in, do_cldice_in, use_hetfrz_classnuc_in, &
+     micro_mg_precip_frac_method_in, micro_mg_berg_eff_factor_in, &
+     allow_sed_supersat_in, do_sb_physics_in, &
+     nccons_in, nicons_in, ncnst_in, ninst_in, ngcons_in, ngnst_in, errstring)
+
+  use micro_mg_utils, only: micro_mg_utils_init
+
+  !-----------------------------------------------------------------------
+  !
+  ! Purpose:
+  ! initialize constants for MG microphysics
+  !
+  ! Author: Andrew Gettelman Dec 2005
+  !
+  !-----------------------------------------------------------------------
+
+  integer,  intent(in)  :: kind         ! Kind used for reals
+  real(r8), intent(in)  :: gravit
+  real(r8), intent(in)  :: rair
+  real(r8), intent(in)  :: rh2o
+  real(r8), intent(in)  :: cpair
+  real(r8), intent(in)  :: tmelt_in     ! Freezing point of water (K)
+  real(r8), intent(in)  :: latvap
+  real(r8), intent(in)  :: latice
+  real(r8), intent(in)  :: rhmini_in    ! Minimum rh for ice cloud fraction > 0.
+  real(r8), intent(in)  :: micro_mg_dcs
+
+!MG3 dense precipitating ice. Note, only 1 can be true, or both false.
+  logical,  intent(in)  :: micro_mg_do_graupel_in    ! .true. = configure with graupel
+                                                   ! .false. = no graupel (hail possible)
+  logical,  intent(in)  :: micro_mg_do_hail_in    ! .true. = configure with hail
+                                                   ! .false. = no hail (graupel possible)
+  logical,  intent(in)  :: microp_uniform_in    ! .true. = configure uniform for sub-columns
+                                            ! .false. = use w/o sub-columns (standard)
+  logical,  intent(in)  :: do_cldice_in     ! .true. = do all processes (standard)
+                                            ! .false. = skip all processes affecting
+                                            !           cloud ice
+  logical,  intent(in)  :: use_hetfrz_classnuc_in ! use heterogeneous freezing
+
+  character(len=16),intent(in)  :: micro_mg_precip_frac_method_in  ! type of precipitation fraction method
+  real(r8),         intent(in)  :: micro_mg_berg_eff_factor_in     ! berg efficiency factor
+  logical,  intent(in)  ::  allow_sed_supersat_in ! allow supersaturated conditions after sedimentation loop
+  logical,  intent(in)  ::  do_sb_physics_in ! do SB autoconversion and accretion physics
+
+  logical, intent(in)   :: nccons_in
+  logical, intent(in)   :: nicons_in
+  real(r8), intent(in)  :: ncnst_in
+  real(r8), intent(in)  :: ninst_in
+
+  logical, intent(in)   :: ngcons_in
+  real(r8), intent(in)  :: ngnst_in
+
+  character(128), intent(out) :: errstring    ! Output status (non-blank for error return)
+
+  !-----------------------------------------------------------------------
+
+  dcs = micro_mg_dcs
+
+  ! Initialize subordinate utilities module.
+  call micro_mg_utils_init(kind, rair, rh2o, cpair, tmelt_in, latvap, latice, &
+       dcs, errstring)
+
+  if (trim(errstring) /= "") return
+
+  ! declarations for MG code (transforms variable names)
+
+  g= gravit                 ! gravity
+  r= rair                   ! dry air gas constant: note units(phys_constants are in J/K/kmol)
+  rv= rh2o                  ! water vapor gas constant
+  cpp = cpair               ! specific heat of dry air
+  tmelt = tmelt_in
+  rhmini = rhmini_in
+  micro_mg_precip_frac_method = micro_mg_precip_frac_method_in
+  micro_mg_berg_eff_factor    = micro_mg_berg_eff_factor_in
+  allow_sed_supersat          = allow_sed_supersat_in
+  do_sb_physics               = do_sb_physics_in
+
+  nccons = nccons_in
+  nicons = nicons_in
+  ncnst  = ncnst_in
+  ninst  = ninst_in
+  ngcons = ngcons_in
+  ngnst  = ngnst_in
+
+  ! latent heats
+
+  xxlv = latvap         ! latent heat vaporization
+  xlf  = latice         ! latent heat freezing
+  xxls = xxlv + xlf     ! latent heat of sublimation
+
+  ! flags
+  microp_uniform = microp_uniform_in
+  do_cldice  = do_cldice_in
+  use_hetfrz_classnuc = use_hetfrz_classnuc_in
+  do_hail = micro_mg_do_hail_in
+  do_graupel = micro_mg_do_graupel_in
+
+  ! typical air density at 850 mb
+
+  rhosu = 85000._r8/(rair * tmelt)
+
+  ! Maximum temperature at which snow is allowed to exist
+  snowmelt = tmelt + 2._r8
+  ! Minimum temperature at which rain is allowed to exist
+  rainfrze = tmelt - 40._r8
+
+  ! Ice nucleation temperature
+  icenuct  = tmelt - 5._r8
+
+  ! Define constants to help speed up code (this limits calls to gamma function)
+  gamma_br_plus1=gamma(1._r8+br)
+  gamma_br_plus4=gamma(4._r8+br)
+  gamma_bs_plus1=gamma(1._r8+bs)
+  gamma_bs_plus4=gamma(4._r8+bs)
+  gamma_bi_plus1=gamma(1._r8+bi)
+  gamma_bi_plus4=gamma(4._r8+bi)
+  gamma_bj_plus1=gamma(1._r8+bj)
+  gamma_bj_plus4=gamma(4._r8+bj)
+  if (do_hail) then
+     gamma_bg_plus1 = gamma(1._r8+bh)
+     gamma_bg_plus4 = gamma(4._r8+bh)
+  end if
+  if (do_graupel) then
+     gamma_bg_plus1 = gamma(1._r8+bg)
+     gamma_bg_plus4 = gamma(4._r8+bg)
+  end if
+  xxlv_squared=xxlv**2
+  xxls_squared=xxls**2
+
+end subroutine micro_mg_init
+
+!===============================================================================
+!microphysics routine for each timestep goes here...
+
+subroutine micro_mg_tend ( &
+     mgncol,             nlev,               deltatin,           &
+     t,                            q,                            &
+     qcn,                          qin,                          &
+     ncn,                          nin,                          &
+     qrn,                          qsn,                          &
+     nrn,                          nsn,                          &
+     qgr,                          ngr,                          &
+     relvar,                       accre_enhan,                  &
+     p,                            pdel,                         &
+     cldn,    liqcldf,        icecldf,       qsatfac,            &
+     qcsinksum_rate1ord,                                         &
+     naai,                         npccn,                        &
+     rndst,                        nacon,                        &
+     tlat,                         qvlat,                        &
+     qctend,                       qitend,                       &
+     nctend,                       nitend,                       &
+     qrtend,                       qstend,                       &
+     nrtend,                       nstend,                       &
+     qgtend,                       ngtend,                       &
+     effc,               effc_fn,            effi,               &
+     sadice,                       sadsnow,                      &
+     prect,                        preci,                        &
+     nevapr,                       evapsnow,                     &
+     am_evp_st,                                                  &
+     prain,                        prodsnow,                     &
+     cmeout,                       deffi,                        &
+     pgamrad,                      lamcrad,                      &
+     qsout,                        dsout,                        &
+     qgout,     ngout,             dgout,                        &
+     lflx,               iflx,                                   &
+     gflx,                                                       &
+     rflx,               sflx,               qrout,              &
+     reff_rain,          reff_snow,          reff_grau,          &
+     qcsevap,            qisevap,            qvres,              &
+     cmeitot,            vtrmc,              vtrmi,              &
+     umr,                          ums,                          &
+     umg,                qgsedten,                               &
+     qcsedten,                     qisedten,                     &
+     qrsedten,                     qssedten,                     &
+     pratot,                       prctot,                       &
+     mnuccctot,          mnuccttot,          msacwitot,          &
+     psacwstot,          bergstot,           bergtot,            &
+     melttot,                      homotot,                      &
+     qcrestot,           prcitot,            praitot,            &
+     qirestot,           mnuccrtot,          mnuccritot, pracstot,           &
+     meltsdttot,         frzrdttot,          mnuccdtot,          &
+     pracgtot,           psacwgtot,          pgsacwtot,          &
+     pgracstot,          prdgtot,           &
+     qmultgtot,          qmultrgtot,         psacrtot,           &
+     npracgtot,          nscngtot,           ngracstot,          &
+     nmultgtot,          nmultrgtot,         npsacwgtot,         & 
+     nrout,                        nsout,                        &
+     refl,               arefl,              areflz,             &
+     frefl,              csrfl,              acsrfl,             &
+     fcsrfl,                       rercld,                       &
+     ncai,                         ncal,                         &
+     qrout2,                       qsout2,                       &
+     nrout2,                       nsout2,                       &
+     drout2,                       dsout2,                       &
+     qgout2,        ngout2,        dgout2,    freqg,                   &
+     freqs,                        freqr,                        &
+     nfice,                        qcrat,                        &
+     errstring, & ! Below arguments are "optional" (pass null pointers to omit).
+     tnd_qsnow,          tnd_nsnow,          re_ice,             &
+     prer_evap,                                                      &
+     frzimm,             frzcnt,             frzdep)
+
+  ! Constituent properties.
+  use micro_mg_utils, only: &
+       mg_liq_props, &
+       mg_ice_props, &
+       mg_rain_props, &
+       mg_graupel_props, &
+       mg_hail_props, &
+       mg_snow_props
+
+  ! Size calculation functions.
+  use micro_mg_utils, only: &
+       size_dist_param_liq, &
+       size_dist_param_basic, &
+       avg_diameter, &
+       avg_diameter_vec, &
+       size_dist_param_liq_vect, &
+       size_dist_param_basic_vect
+
+  ! Microphysical processes.
+  use micro_mg_utils, only: &
+       ice_deposition_sublimation, &
+       sb2001v2_liq_autoconversion,&
+       sb2001v2_accre_cld_water_rain,&       
+       kk2000_liq_autoconversion, &
+       ice_autoconversion, &
+       immersion_freezing, &
+       contact_freezing, &
+       snow_self_aggregation, &
+       accrete_cloud_water_snow, &
+       secondary_ice_production, &
+       accrete_rain_snow, &
+       heterogeneous_rain_freezing, &
+       accrete_cloud_water_rain, &
+       self_collection_rain, &
+       accrete_cloud_ice_snow, &
+       evaporate_sublimate_precip, &
+       bergeron_process_snow, &
+       graupel_collecting_snow, &
+       graupel_collecting_rain, &
+       graupel_collecting_cld_water, &
+       graupel_riming_liquid_snow, &
+       graupel_rain_riming_snow, &
+       graupel_rime_splintering, &
+       evaporate_sublimate_precip_graupel
+
+  !Authors: Hugh Morrison, Andrew Gettelman, NCAR, Peter Caldwell, LLNL
+  ! e-mail: morrison@ucar.edu, andrew@ucar.edu
+
+  ! input arguments
+  integer,  intent(in) :: mgncol         ! number of microphysics columns
+  integer,  intent(in) :: nlev           ! number of layers
+  real(r8), intent(in) :: deltatin       ! time step (s)
+  real(r8), intent(in) :: t(mgncol,nlev) ! input temperature (K)
+  real(r8), intent(in) :: q(mgncol,nlev) ! input h20 vapor mixing ratio (kg/kg)
+
+  ! note: all input cloud variables are grid-averaged
+  real(r8), intent(in) :: qcn(mgncol,nlev)       ! cloud water mixing ratio (kg/kg)
+  real(r8), intent(in) :: qin(mgncol,nlev)       ! cloud ice mixing ratio (kg/kg)
+  real(r8), intent(in) :: ncn(mgncol,nlev)       ! cloud water number conc (1/kg)
+  real(r8), intent(in) :: nin(mgncol,nlev)       ! cloud ice number conc (1/kg)
+
+  real(r8), intent(in) :: qrn(mgncol,nlev)       ! rain mixing ratio (kg/kg)
+  real(r8), intent(in) :: qsn(mgncol,nlev)       ! snow mixing ratio (kg/kg)
+  real(r8), intent(in) :: nrn(mgncol,nlev)       ! rain number conc (1/kg)
+  real(r8), intent(in) :: nsn(mgncol,nlev)       ! snow number conc (1/kg)
+  real(r8), intent(in) :: qgr(mgncol,nlev)       ! graupel/hail mixing ratio (kg/kg)
+  real(r8), intent(in) :: ngr(mgncol,nlev)       ! graupel/hail number conc (1/kg)
+
+  real(r8), intent(in) :: relvar(mgncol,nlev)      ! cloud water relative variance (-)
+  real(r8), intent(in) :: accre_enhan(mgncol,nlev) ! optional accretion
+                                             ! enhancement factor (-)
+
+  real(r8), intent(in) :: p(mgncol,nlev)        ! air pressure (pa)
+  real(r8), intent(in) :: pdel(mgncol,nlev)     ! pressure difference across level (pa)
+
+  real(r8), intent(in) :: cldn(mgncol,nlev)      ! cloud fraction (no units)
+  real(r8), intent(in) :: liqcldf(mgncol,nlev)   ! liquid cloud fraction (no units)
+  real(r8), intent(in) :: icecldf(mgncol,nlev)   ! ice cloud fraction (no units)
+  real(r8), intent(in) :: qsatfac(mgncol,nlev)   ! subgrid cloud water saturation scaling factor (no units)
+
+  ! used for scavenging
+  ! Inputs for aerosol activation
+  real(r8), intent(in) :: naai(mgncol,nlev)     ! ice nucleation number (from microp_aero_ts) (1/kg)
+  real(r8), intent(in) :: npccn(mgncol,nlev)   ! ccn activated number tendency (from microp_aero_ts) (1/kg*s)
+
+  ! Note that for these variables, the dust bin is assumed to be the last index.
+  ! (For example, in CAM, the last dimension is always size 4.)
+  real(r8), intent(in) :: rndst(:,:,:)  ! radius of each dust bin, for contact freezing (from microp_aero_ts) (m)
+  real(r8), intent(in) :: nacon(:,:,:) ! number in each dust bin, for contact freezing  (from microp_aero_ts) (1/m^3)
+  
+  ! output arguments
+
+  real(r8), intent(out) :: qcsinksum_rate1ord(mgncol,nlev) ! 1st order rate for
+  ! direct cw to precip conversion
+  real(r8), intent(out) :: tlat(mgncol,nlev)         ! latent heating rate       (W/kg)
+  real(r8), intent(out) :: qvlat(mgncol,nlev)        ! microphysical tendency qv (1/s)
+  real(r8), intent(out) :: qctend(mgncol,nlev)       ! microphysical tendency qc (1/s)
+  real(r8), intent(out) :: qitend(mgncol,nlev)       ! microphysical tendency qi (1/s)
+  real(r8), intent(out) :: nctend(mgncol,nlev)       ! microphysical tendency nc (1/(kg*s))
+  real(r8), intent(out) :: nitend(mgncol,nlev)       ! microphysical tendency ni (1/(kg*s))
+
+  real(r8), intent(out) :: qrtend(mgncol,nlev)       ! microphysical tendency qr (1/s)
+  real(r8), intent(out) :: qstend(mgncol,nlev)       ! microphysical tendency qs (1/s)
+  real(r8), intent(out) :: nrtend(mgncol,nlev)       ! microphysical tendency nr (1/(kg*s))
+  real(r8), intent(out) :: nstend(mgncol,nlev)       ! microphysical tendency ns (1/(kg*s))
+  real(r8), intent(out) :: qgtend(mgncol,nlev)       ! microphysical tendency qg (1/s)
+  real(r8), intent(out) :: ngtend(mgncol,nlev)       ! microphysical tendency ng (1/(kg*s))
+
+  real(r8), intent(out) :: effc(mgncol,nlev)         ! droplet effective radius (micron)
+  real(r8), intent(out) :: effc_fn(mgncol,nlev)      ! droplet effective radius, assuming nc = 1.e8 kg-1
+  real(r8), intent(out) :: effi(mgncol,nlev)         ! cloud ice effective radius (micron)
+  real(r8), intent(out) :: sadice(mgncol,nlev)       ! cloud ice surface area density (cm2/cm3)
+  real(r8), intent(out) :: sadsnow(mgncol,nlev)      ! cloud snow surface area density (cm2/cm3)
+  real(r8), intent(out) :: prect(mgncol)             ! surface precip rate (m/s)
+  real(r8), intent(out) :: preci(mgncol)             ! cloud ice/snow precip rate (m/s)
+  real(r8), intent(out) :: nevapr(mgncol,nlev)       ! evaporation rate of rain + snow (1/s)
+  real(r8), intent(out) :: evapsnow(mgncol,nlev)     ! sublimation rate of snow (1/s)
+  real(r8), intent(out) :: am_evp_st(mgncol,nlev)    ! stratiform evaporation area (frac)
+  real(r8), intent(out) :: prain(mgncol,nlev)        ! production of rain + snow (1/s)
+  real(r8), intent(out) :: prodsnow(mgncol,nlev)     ! production of snow (1/s)
+  real(r8), intent(out) :: cmeout(mgncol,nlev)       ! evap/sub of cloud (1/s)
+  real(r8), intent(out) :: deffi(mgncol,nlev)        ! ice effective diameter for optics (radiation) (micron)
+  real(r8), intent(out) :: pgamrad(mgncol,nlev)      ! ice gamma parameter for optics (radiation) (no units)
+  real(r8), intent(out) :: lamcrad(mgncol,nlev)      ! slope of droplet distribution for optics (radiation) (1/m)
+  real(r8), intent(out) :: qsout(mgncol,nlev)        ! snow mixing ratio (kg/kg)
+  real(r8), intent(out) :: dsout(mgncol,nlev)        ! snow diameter (m)
+  real(r8), intent(out) :: lflx(mgncol,nlev+1)       ! grid-box average liquid condensate flux (kg m^-2 s^-1)
+  real(r8), intent(out) :: iflx(mgncol,nlev+1)       ! grid-box average ice condensate flux (kg m^-2 s^-1)
+  real(r8), intent(out) :: rflx(mgncol,nlev+1)       ! grid-box average rain flux (kg m^-2 s^-1)
+  real(r8), intent(out) :: sflx(mgncol,nlev+1)       ! grid-box average snow flux (kg m^-2 s^-1)
+  real(r8), intent(out) :: gflx(mgncol,nlev+1)       ! grid-box average graupel/hail flux (kg m^-2 s^-1)
+
+  real(r8), intent(out) :: qrout(mgncol,nlev)        ! grid-box average rain mixing ratio (kg/kg)
+  real(r8), intent(out) :: reff_rain(mgncol,nlev)    ! rain effective radius (micron)
+  real(r8), intent(out) :: reff_snow(mgncol,nlev)    ! snow effective radius (micron)
+  real(r8), intent(out) :: reff_grau(mgncol,nlev)    ! graupel effective radius (micron)
+  real(r8), intent(out) :: qcsevap(mgncol,nlev)      ! cloud water evaporation due to sedimentation (1/s)
+  real(r8), intent(out) :: qisevap(mgncol,nlev)      ! cloud ice sublimation due to sublimation (1/s)
+  real(r8), intent(out) :: qvres(mgncol,nlev)        ! residual condensation term to ensure RH < 100% (1/s)
+  real(r8), intent(out) :: cmeitot(mgncol,nlev)      ! grid-mean cloud ice sub/dep (1/s)
+  real(r8), intent(out) :: vtrmc(mgncol,nlev)        ! mass-weighted cloud water fallspeed (m/s)
+  real(r8), intent(out) :: vtrmi(mgncol,nlev)        ! mass-weighted cloud ice fallspeed (m/s)
+  real(r8), intent(out) :: umr(mgncol,nlev)          ! mass weighted rain fallspeed (m/s)
+  real(r8), intent(out) :: ums(mgncol,nlev)          ! mass weighted snow fallspeed (m/s)
+  real(r8), intent(out) :: umg(mgncol,nlev)          ! mass weighted graupel/hail fallspeed (m/s)
+  real(r8), intent(out) :: qgsedten(mgncol,nlev)     ! qg sedimentation tendency (1/s)
+  real(r8), intent(out) :: qcsedten(mgncol,nlev)     ! qc sedimentation tendency (1/s)
+  real(r8), intent(out) :: qisedten(mgncol,nlev)     ! qi sedimentation tendency (1/s)
+  real(r8), intent(out) :: qrsedten(mgncol,nlev)     ! qr sedimentation tendency (1/s)
+  real(r8), intent(out) :: qssedten(mgncol,nlev)     ! qs sedimentation tendency (1/s)
+
+  ! microphysical process rates for output (mixing ratio tendencies) (all have units of 1/s)
+  real(r8), intent(out) :: pratot(mgncol,nlev)          ! accretion of cloud by rain
+  real(r8), intent(out) :: prctot(mgncol,nlev)          ! autoconversion of cloud to rain
+  real(r8), intent(out) :: mnuccctot(mgncol,nlev)       ! mixing ratio tend due to immersion freezing
+  real(r8), intent(out) :: mnuccttot(mgncol,nlev)       ! mixing ratio tend due to contact freezing
+  real(r8), intent(out) :: msacwitot(mgncol,nlev)       ! mixing ratio tend due to H-M splintering
+  real(r8), intent(out) :: psacwstot(mgncol,nlev)       ! collection of cloud water by snow
+  real(r8), intent(out) :: bergstot(mgncol,nlev)        ! bergeron process on snow
+  real(r8), intent(out) :: bergtot(mgncol,nlev)         ! bergeron process on cloud ice
+  real(r8), intent(out) :: melttot(mgncol,nlev)         ! melting of cloud ice
+  real(r8), intent(out) :: homotot(mgncol,nlev)         ! homogeneous freezing cloud water
+  real(r8), intent(out) :: qcrestot(mgncol,nlev)        ! residual cloud condensation due to removal of excess supersat
+  real(r8), intent(out) :: prcitot(mgncol,nlev)         ! autoconversion of cloud ice to snow
+  real(r8), intent(out) :: praitot(mgncol,nlev)         ! accretion of cloud ice by snow
+  real(r8), intent(out) :: qirestot(mgncol,nlev)        ! residual ice deposition due to removal of excess supersat
+  real(r8), intent(out) :: mnuccrtot(mgncol,nlev)       ! mixing ratio tendency due to heterogeneous freezing of rain to snow (1/s)
+  real(r8), intent(out) :: mnuccritot(mgncol,nlev)      ! mixing ratio tendency due to heterogeneous freezing of rain to ice (1/s)
+  real(r8), intent(out) :: pracstot(mgncol,nlev)        ! mixing ratio tendency due to accretion of rain by snow (1/s)
+  real(r8), intent(out) :: meltsdttot(mgncol,nlev)      ! latent heating rate due to melting of snow  (W/kg)
+  real(r8), intent(out) :: frzrdttot(mgncol,nlev)       ! latent heating rate due to homogeneous freezing of rain (W/kg)
+  real(r8), intent(out) :: mnuccdtot(mgncol,nlev)       ! mass tendency from ice nucleation
+  real(r8), intent(out) :: pracgtot(mgncol,nlev)        ! change in q collection rain by graupel  (precipf)
+  real(r8), intent(out) :: psacwgtot(mgncol,nlev)       ! change in q collection droplets by graupel (lcldm)
+  real(r8), intent(out) :: pgsacwtot(mgncol,nlev)       ! conversion q to graupel due to collection droplets by snow  (lcldm)
+  real(r8), intent(out) :: pgracstot(mgncol,nlev)       ! conversion q to graupel due to collection rain by snow (precipf)
+  real(r8), intent(out) :: prdgtot(mgncol,nlev)         ! dep of graupel (precipf)
+  real(r8), intent(out) :: qmultgtot(mgncol,nlev)       ! change q due to ice mult droplets/graupel  (lcldm)
+  real(r8), intent(out) :: qmultrgtot(mgncol,nlev)      ! change q due to ice mult rain/graupel (precipf)
+  real(r8), intent(out) :: psacrtot(mgncol,nlev)        ! conversion due to coll of snow by rain (precipf)
+  real(r8), intent(out) :: npracgtot(mgncol,nlev)       ! change n collection rain by graupel  (precipf)
+  real(r8), intent(out) :: nscngtot(mgncol,nlev)        ! change n conversion to graupel due to collection droplets by snow (lcldm)
+  real(r8), intent(out) :: ngracstot(mgncol,nlev)       ! change n conversion to graupel due to collection rain by snow (precipf)
+  real(r8), intent(out) :: nmultgtot(mgncol,nlev)       ! ice mult due to acc droplets by graupel  (lcldm)
+  real(r8), intent(out) :: nmultrgtot(mgncol,nlev)      ! ice mult due to acc rain by graupel  (precipf)
+  real(r8), intent(out) :: npsacwgtot(mgncol,nlev)      ! change n collection droplets by graupel (lcldm?)
+  real(r8), intent(out) :: nrout(mgncol,nlev)        ! rain number concentration (1/m3)
+  real(r8), intent(out) :: nsout(mgncol,nlev)        ! snow number concentration (1/m3)
+  real(r8), intent(out) :: refl(mgncol,nlev)         ! analytic radar reflectivity
+  real(r8), intent(out) :: arefl(mgncol,nlev)        ! average reflectivity will zero points outside valid range
+  real(r8), intent(out) :: areflz(mgncol,nlev)       ! average reflectivity in z.
+  real(r8), intent(out) :: frefl(mgncol,nlev)        ! fractional occurrence of radar reflectivity
+  real(r8), intent(out) :: csrfl(mgncol,nlev)        ! cloudsat reflectivity
+  real(r8), intent(out) :: acsrfl(mgncol,nlev)       ! cloudsat average
+  real(r8), intent(out) :: fcsrfl(mgncol,nlev)       ! cloudsat fractional occurrence of radar reflectivity
+  real(r8), intent(out) :: rercld(mgncol,nlev)       ! effective radius calculation for rain + cloud
+  real(r8), intent(out) :: ncai(mgncol,nlev)         ! output number conc of ice nuclei available (1/m3)
+  real(r8), intent(out) :: ncal(mgncol,nlev)         ! output number conc of CCN (1/m3)
+  real(r8), intent(out) :: qrout2(mgncol,nlev)       ! copy of qrout as used to compute drout2
+  real(r8), intent(out) :: qsout2(mgncol,nlev)       ! copy of qsout as used to compute dsout2
+  real(r8), intent(out) :: nrout2(mgncol,nlev)       ! copy of nrout as used to compute drout2
+  real(r8), intent(out) :: nsout2(mgncol,nlev)       ! copy of nsout as used to compute dsout2
+  real(r8), intent(out) :: drout2(mgncol,nlev)       ! mean rain particle diameter (m)
+  real(r8), intent(out) :: dsout2(mgncol,nlev)       ! mean snow particle diameter (m)
+  real(r8), intent(out) :: freqs(mgncol,nlev)        ! fractional occurrence of snow
+  real(r8), intent(out) :: freqr(mgncol,nlev)        ! fractional occurrence of rain
+  real(r8), intent(out) :: nfice(mgncol,nlev)        ! fractional occurrence of ice
+  real(r8), intent(out) :: qcrat(mgncol,nlev)        ! limiter for qc process rates (1=no limit --> 0. no qc)
+  real(r8), intent(out) :: qgout(mgncol,nlev)        ! graupel/hail mixing ratio (kg/kg)
+  real(r8), intent(out) :: dgout(mgncol,nlev)        ! graupel/hail diameter (m)
+  real(r8), intent(out) :: ngout(mgncol,nlev)        ! graupel/hail number concentration (1/m3)
+  real(r8), intent(out) :: qgout2(mgncol,nlev)       ! copy of qgout as used to compute dgout2
+  real(r8), intent(out) :: ngout2(mgncol,nlev)       ! copy of ngout as used to compute dgout2
+  real(r8), intent(out) :: dgout2(mgncol,nlev)       ! mean graupel/hail particle diameter (m)
+  real(r8), intent(out) :: freqg(mgncol,nlev)        ! fractional occurrence of graupel  
+
+  real(r8), intent(out) :: prer_evap(mgncol,nlev)
+
+  character(128),   intent(out) :: errstring  ! output status (non-blank for error return)
+
+  ! Tendencies calculated by external schemes that can replace MG's native
+  ! process tendencies.
+
+  ! Used with CARMA cirrus microphysics
+  ! (or similar external microphysics model)
+  real(r8), intent(in) :: tnd_qsnow(:,:) ! snow mass tendency (kg/kg/s)
+  real(r8), intent(in) :: tnd_nsnow(:,:) ! snow number tendency (#/kg/s)
+  real(r8), intent(in) :: re_ice(:,:)    ! ice effective radius (m)
+
+  ! From external ice nucleation.
+  real(r8), intent(in) :: frzimm(:,:) ! Number tendency due to immersion freezing (1/cm3)
+  real(r8), intent(in) :: frzcnt(:,:) ! Number tendency due to contact freezing (1/cm3)
+  real(r8), intent(in) :: frzdep(:,:) ! Number tendency due to deposition nucleation (1/cm3)
+
+  ! local workspace
+  ! all units mks unless otherwise stated
+
+  ! local copies of input variables
+  real(r8) :: qc(mgncol,nlev)      ! cloud liquid mixing ratio (kg/kg)
+  real(r8) :: qi(mgncol,nlev)      ! cloud ice mixing ratio (kg/kg)
+  real(r8) :: nc(mgncol,nlev)      ! cloud liquid number concentration (1/kg)
+  real(r8) :: ni(mgncol,nlev)      ! cloud liquid number concentration (1/kg)
+  real(r8) :: qr(mgncol,nlev)      ! rain mixing ratio (kg/kg)
+  real(r8) :: qs(mgncol,nlev)      ! snow mixing ratio (kg/kg)
+  real(r8) :: nr(mgncol,nlev)      ! rain number concentration (1/kg)
+  real(r8) :: ns(mgncol,nlev)      ! snow number concentration (1/kg)
+  real(r8) :: qg(mgncol,nlev)      ! graupel mixing ratio (kg/kg)
+  real(r8) :: ng(mgncol,nlev)      ! graupel number concentration (1/kg)
+  real(r8) :: rhogtmp              ! hail or graupel density (kg m-3)
+
+  ! general purpose variables
+  real(r8) :: deltat            ! sub-time step (s)
+  real(r8) :: mtime             ! the assumed ice nucleation timescale
+  real(r8) :: rdeltat           ! reciprocal of sub-time step (1/s)
+
+  ! physical properties of the air at a given point
+  real(r8) :: rho(mgncol,nlev)    ! density (kg m-3)
+  real(r8) :: dv(mgncol,nlev)     ! diffusivity of water vapor
+  real(r8) :: mu(mgncol,nlev)     ! viscosity
+  real(r8) :: sc(mgncol,nlev)     ! schmidt number
+  real(r8) :: rhof(mgncol,nlev)   ! density correction factor for fallspeed
+
+  ! cloud fractions
+  real(r8) :: precip_frac(mgncol,nlev) ! precip fraction assuming maximum overlap
+  real(r8) :: cldm(mgncol,nlev)   ! cloud fraction
+  real(r8) :: icldm(mgncol,nlev)  ! ice cloud fraction
+  real(r8) :: lcldm(mgncol,nlev)  ! liq cloud fraction
+  real(r8) :: qsfm(mgncol,nlev)   ! subgrid cloud water saturation scaling factor
+
+  ! mass mixing ratios
+  real(r8) :: qcic(mgncol,nlev)   ! in-cloud cloud liquid
+  real(r8) :: qiic(mgncol,nlev)   ! in-cloud cloud ice
+  real(r8) :: qsic(mgncol,nlev)   ! in-precip snow
+  real(r8) :: qric(mgncol,nlev)   ! in-precip rain
+  real(r8) :: qgic(mgncol,nlev)   ! in-precip graupel/hail
+
+  ! number concentrations
+  real(r8) :: ncic(mgncol,nlev)   ! in-cloud droplet
+  real(r8) :: niic(mgncol,nlev)   ! in-cloud cloud ice
+  real(r8) :: nsic(mgncol,nlev)   ! in-precip snow
+  real(r8) :: nric(mgncol,nlev)   ! in-precip rain
+  real(r8) :: ngic(mgncol,nlev)   ! in-precip graupel/hail
+
+  ! maximum allowed ni value
+  real(r8) :: nimax(mgncol,nlev)
+
+  ! Size distribution parameters for:
+  ! cloud ice
+  real(r8) :: lami(mgncol,nlev)   ! slope
+  real(r8) :: n0i(mgncol,nlev)    ! intercept
+  ! cloud liquid
+  real(r8) :: lamc(mgncol,nlev)   ! slope
+  real(r8) :: pgam(mgncol,nlev)   ! spectral width parameter
+  ! snow
+  real(r8) :: lams(mgncol,nlev)   ! slope
+  real(r8) :: n0s(mgncol,nlev)    ! intercept
+  ! rain
+  real(r8) :: lamr(mgncol,nlev)   ! slope
+  real(r8) :: n0r(mgncol,nlev)    ! intercept 
+  ! graupel/hail
+  real(r8) :: lamg(mgncol,nlev)   ! slope
+  real(r8) :: n0g(mgncol,nlev)    ! intercept
+  real(r8) :: bgtmp               ! tmp fall speed parameter
+
+  ! Rates/tendencies due to:
+
+  ! Instantaneous snow melting
+  real(r8) :: minstsm(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: ninstsm(mgncol,nlev)    ! number concentration
+  ! Instantaneous graupel melting
+  real(r8) :: minstgm(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: ninstgm(mgncol,nlev)    ! number concentration
+
+  ! Instantaneous rain freezing
+  real(r8) :: minstrf(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: ninstrf(mgncol,nlev)    ! number concentration
+
+  ! deposition of cloud ice
+  real(r8) :: vap_dep(mgncol,nlev)    ! deposition from vapor to ice PMC 12/3/12
+  ! sublimation of cloud ice
+  real(r8) :: ice_sublim(mgncol,nlev) ! sublimation from ice to vapor PMC 12/3/12
+  ! ice nucleation
+  real(r8) :: nnuccd(mgncol,nlev) ! number rate from deposition/cond.-freezing
+  real(r8) :: mnuccd(mgncol,nlev) ! mass mixing ratio
+  ! freezing of cloud water
+  real(r8) :: mnuccc(mgncol,nlev) ! mass mixing ratio
+  real(r8) :: nnuccc(mgncol,nlev) ! number concentration
+  ! contact freezing of cloud water
+  real(r8) :: mnucct(mgncol,nlev) ! mass mixing ratio
+  real(r8) :: nnucct(mgncol,nlev) ! number concentration
+  ! deposition nucleation in mixed-phase clouds (from external scheme)
+  real(r8) :: mnudep(mgncol,nlev) ! mass mixing ratio
+  real(r8) :: nnudep(mgncol,nlev) ! number concentration
+  ! ice multiplication
+  real(r8) :: msacwi(mgncol,nlev) ! mass mixing ratio
+  real(r8) :: nsacwi(mgncol,nlev) ! number concentration
+  ! autoconversion of cloud droplets
+  real(r8) :: prc(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: nprc(mgncol,nlev)   ! number concentration (rain)
+  real(r8) :: nprc1(mgncol,nlev)  ! number concentration (cloud droplets)
+  ! self-aggregation of snow
+  real(r8) :: nsagg(mgncol,nlev)  ! number concentration
+  ! self-collection of rain
+  real(r8) :: nragg(mgncol,nlev)  ! number concentration
+  ! collection of droplets by snow
+  real(r8) :: psacws(mgncol,nlev)     ! mass mixing ratio
+  real(r8) :: npsacws(mgncol,nlev)    ! number concentration
+  ! collection of rain by snow
+  real(r8) :: pracs(mgncol,nlev)  ! mass mixing ratio
+  real(r8) :: npracs(mgncol,nlev) ! number concentration
+  ! freezing of rain
+  real(r8) :: mnuccr(mgncol,nlev) ! mass mixing ratio
+  real(r8) :: nnuccr(mgncol,nlev) ! number concentration
+  ! freezing of rain to form ice (mg add 4/26/13)
+  real(r8) :: mnuccri(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: nnuccri(mgncol,nlev)    ! number concentration
+  ! accretion of droplets by rain
+  real(r8) :: pra(mgncol,nlev)    ! mass mixing ratio
+  real(r8) :: npra(mgncol,nlev)   ! number concentration
+  ! autoconversion of cloud ice to snow
+  real(r8) :: prci(mgncol,nlev)   ! mass mixing ratio
+  real(r8) :: nprci(mgncol,nlev)  ! number concentration
+  ! accretion of cloud ice by snow
+  real(r8) :: prai(mgncol,nlev)   ! mass mixing ratio
+  real(r8) :: nprai(mgncol,nlev)  ! number concentration
+  ! evaporation of rain
+  real(r8) :: pre(mgncol,nlev)    ! mass mixing ratio
+  ! sublimation of snow
+  real(r8) :: prds(mgncol,nlev)   ! mass mixing ratio
+  ! number evaporation
+  real(r8) :: nsubi(mgncol,nlev)  ! cloud ice
+  real(r8) :: nsubc(mgncol,nlev)  ! droplet
+  real(r8) :: nsubs(mgncol,nlev)  ! snow
+  real(r8) :: nsubr(mgncol,nlev)  ! rain
+  ! bergeron process
+  real(r8) :: berg(mgncol,nlev)   ! mass mixing ratio (cloud ice)
+  real(r8) :: bergs(mgncol,nlev)  ! mass mixing ratio (snow)
+
+  !graupel/hail processes
+  real(r8) :: npracg(mgncol,nlev)  ! change n collection rain by graupel  (precipf)
+  real(r8) :: nscng(mgncol,nlev)   ! change n conversion to graupel due to collection droplets by snow (lcldm)
+  real(r8) :: ngracs(mgncol,nlev)  ! change n conversion to graupel due to collection rain by snow (precipf)
+  real(r8) :: nmultg(mgncol,nlev)  ! ice mult due to acc droplets by graupel  (lcldm)
+  real(r8) :: nmultrg(mgncol,nlev) ! ice mult due to acc rain by graupel  (precipf)
+  real(r8) :: npsacwg(mgncol,nlev) ! change n collection droplets by graupel (lcldm)
+
+  real(r8) :: psacr(mgncol,nlev)   ! conversion due to coll of snow by rain (precipf)
+  real(r8) :: pracg(mgncol,nlev)   ! change in q collection rain by graupel  (precipf)
+  real(r8) :: psacwg(mgncol,nlev)  ! change in q collection droplets by graupel (lcldm)
+  real(r8) :: pgsacw(mgncol,nlev)  ! conversion q to graupel due to collection droplets by snow  (lcldm)
+  real(r8) :: pgracs(mgncol,nlev)  ! conversion q to graupel due to collection rain by snow (precipf)
+  real(r8) :: prdg(mgncol,nlev)    ! dep of graupel (precipf)
+  real(r8) :: qmultg(mgncol,nlev)  ! change q due to ice mult droplets/graupel  (lcldm)
+  real(r8) :: qmultrg(mgncol,nlev) ! change q due to ice mult rain/graupel (precipf)
+
+
+  ! fallspeeds
+  ! number-weighted
+  real(r8) :: uns(mgncol,nlev)    ! snow
+  real(r8) :: unr(mgncol,nlev)    ! rain
+  real(r8) :: ung(mgncol,nlev)    ! graupel/hail
+
+  ! air density corrected fallspeed parameters
+  real(r8) :: arn(mgncol,nlev)    ! rain
+  real(r8) :: asn(mgncol,nlev)    ! snow
+  real(r8) :: agn(mgncol,nlev)    ! graupel
+  real(r8) :: acn(mgncol,nlev)    ! cloud droplet
+  real(r8) :: ain(mgncol,nlev)    ! cloud ice
+  real(r8) :: ajn(mgncol,nlev)    ! cloud small ice
+
+  ! Mass of liquid droplets used with external heterogeneous freezing.
+  real(r8) :: mi0l(mgncol,nlev)
+
+  ! saturation vapor pressures
+  real(r8) :: esl(mgncol,nlev)    ! liquid
+  real(r8) :: esi(mgncol,nlev)    ! ice
+  real(r8) :: esnA(mgncol,nlev)        ! checking for RH after rain evap
+
+  ! saturation vapor mixing ratios
+  real(r8) :: qvl(mgncol,nlev)    ! liquid
+  real(r8) :: qvi(mgncol,nlev)    ! ice
+  real(r8) :: qvnA(mgncol,nlev), qvnAI(mgncol,nlev)  ! checking for RH after rain evap
+
+  ! relative humidity
+  real(r8) :: relhum(mgncol,nlev)
+
+  ! parameters for cloud water and cloud ice sedimentation calculations
+  real(r8) :: fc(mgncol,nlev)
+  real(r8) :: fnc(mgncol,nlev)
+  real(r8) :: fi(mgncol,nlev)
+  real(r8) :: fni(mgncol,nlev)
+  real(r8) :: fg(mgncol,nlev)
+  real(r8) :: fng(mgncol,nlev)
+  real(r8) :: fr(mgncol,nlev)
+  real(r8) :: fnr(mgncol,nlev)
+  real(r8) :: fs(mgncol,nlev)
+  real(r8) :: fns(mgncol,nlev)
+
+  real(r8) :: rainrt(mgncol,nlev)     ! rain rate for reflectivity calculation
+
+  ! dummy variables
+  real(r8) :: dum, dum1, dum2, dum3, dum4, qtmp
+  real(r8) :: dum1A(mgncol,nlev), dum2A(mgncol,nlev), dum3A(mgncol,nlev)
+  real(r8) :: dumni0, dumni0A2D(mgncol,nlev)
+  real(r8) :: dumns0, dumns0A2D(mgncol,nlev)
+  ! dummies for checking RH
+  real(r8) :: ttmpA(mgncol,nlev), qtmpAI(mgncol,nlev)
+  ! dummies for conservation check
+  real(r8) :: ratio
+  real(r8) :: tmpfrz
+  ! dummies for in-cloud variables
+  real(r8) :: dumc(mgncol,nlev)   ! qc
+  real(r8) :: dumnc(mgncol,nlev)  ! nc
+  real(r8) :: dumi(mgncol,nlev)   ! qi
+  real(r8) :: dumni(mgncol,nlev)  ! ni
+  real(r8) :: dumr(mgncol,nlev)   ! rain mixing ratio
+  real(r8) :: dumnr(mgncol,nlev)  ! rain number concentration
+  real(r8) :: dums(mgncol,nlev)   ! snow mixing ratio
+  real(r8) :: dumns(mgncol,nlev)  ! snow number concentration
+  real(r8) :: dumg(mgncol,nlev)   ! graupel mixing ratio
+  real(r8) :: dumng(mgncol,nlev)  ! graupel number concentration
+  ! Array dummy variable
+  real(r8) :: dum_2D(mgncol,nlev)
+  real(r8) :: pdel_inv(mgncol,nlev)
+
+  ! loop array variables
+  ! "i" and "k" are column/level iterators for internal (MG) variables
+  ! "n" is used for other looping (currently just sedimentation)
+  integer i, k, n
+
+  ! number of sub-steps for loops over "n" (for sedimentation)
+  integer nstep
+  integer mdust
+  integer :: precip_frac_method
+
+  ! Varaibles to scale fall velocity between small and regular ice regimes.
+  real(r8) :: irad
+  real(r8) :: ifrac
+
+  !cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+!$acc declare copyin (nccons,nicons,ngcons,ncnst,ninst,ngnst,dcs,g,r,rv,cpp,   &
+!$acc                 xxlv,xlf,microp_uniform,do_cldice,use_hetfrz_classnuc,   &
+!$acc                 do_hail,do_graupel,rhosu,icenuct,snowmelt,rainfrze,xxls, &
+!$acc                 tmelt,rhmini,xxlv_squared,xxls_squared,do_sb_physics,    &
+!$acc                 gamma_br_plus4,gamma_bs_plus1,gamma_bs_plus4,            &
+!$acc                 gamma_bi_plus4,gamma_bj_plus1,gamma_bj_plus4,            &
+!$acc                 gamma_br_plus1,gamma_bi_plus1,gamma_bg_plus4,            &
+!$acc                 gamma_bg_plus1,micro_mg_berg_eff_factor,allow_sed_supersat)
+
+  ! Return error message
+  errstring = ' '
+
+  ! Process inputs
+
+  ! assign variable deltat to deltatin
+  deltat  = deltatin
+  rdeltat = 1._r8 / deltat
+
+  if (trim(micro_mg_precip_frac_method) == 'in_cloud') then
+     precip_frac_method =  MG_PRECIP_FRAC_INCLOUD
+  else if(trim(micro_mg_precip_frac_method) == 'max_overlap') then
+     precip_frac_method = MG_PRECIP_FRAC_OVERLAP
+  endif
+
+  !===============================================
+  ! set mtime here to avoid answer-changing
+  mtime=deltat
+
+  bgtmp=0._r8
+  rhogtmp=0._r8
+
+  if (do_hail) then 
+     bgtmp = bh 
+     rhogtmp = rhoh
+  end if
+  if (do_graupel) then 
+     bgtmp = bg
+     rhogtmp = rhog
+  end if
+
+  mdust = size(rndst,3)
+
+!$acc data copyin  (t,q,qcn,qin,ncn,nin,qrn,qsn,nrn,nsn,qgr,ngr,relvar,frzimm, &
+!$acc               accre_enhan,p,pdel,cldn,liqcldf,icecldf,qsatfac,frzcnt,    &
+!$acc               naai,npccn,rndst,nacon,tnd_qsnow,tnd_nsnow,re_ice,frzdep,  &
+!$acc               mg_liq_props,mg_ice_props,mg_rain_props,mg_graupel_props,  &
+!$acc               mg_hail_props,mg_snow_props)                               &
+!$acc      copyout (qcsinksum_rate1ord,tlat,qvlat,qctend,qitend,nctend,rercld, &
+!$acc               nitend,qrtend,qstend,nrtend,nstend,bergstot,bergtot,effc,  &
+!$acc               effc_fn,effi,sadice,sadsnow,prect,preci,nevapr,evapsnow,   &
+!$acc               am_evp_st,prain,prodsnow,cmeout,deffi,pgamrad,psacwstot,   &
+!$acc               qsout,dsout,lflx,iflx,rflx,sflx,gflx,reff_rain,qssedten,   &
+!$acc               reff_snow,reff_grau,qcsevap,qisevap,qvres,cmeitot,vtrmc,   &
+!$acc               vtrmi,umr,ums,umg,qgsedten,qcsedten,qisedten,qrsedten,     &
+!$acc               pratot,prctot,mnuccctot,mnuccttot,msacwitot,freqg,qrout,   &
+!$acc               qgtend,ngtend,lamcrad,melttot,homotot,qcrestot,prer_evap,  &
+!$acc               prcitot,praitot,qirestot,mnuccrtot,mnuccritot,pracstot,    &
+!$acc               meltsdttot,frzrdttot,mnuccdtot,pracgtot,psacwgtot,fcsrfl,  &
+!$acc               pgsacwtot,pgracstot,prdgtot,qmultgtot,qmultrgtot,psacrtot, &
+!$acc               npracgtot,nscngtot,ngracstot,nmultgtot,nmultrgtot,nrout,   &
+!$acc               nsout,refl,arefl,npsacwgtot,areflz,frefl,csrfl,acsrfl,     &
+!$acc               ncai,ncal,qrout2,qsout2,nrout2,nsout2,drout2,dsout2,freqs, &
+!$acc               freqr,nfice,qcrat,qgout,dgout,ngout,qgout2,ngout2,dgout2)  &
+!$acc      create  (qc,qi,nc,ni,qr,qs,nr,ns,qg,ng,rho,dv,mu,sc,rhof,pdel_inv,  &
+!$acc               precip_frac,cldm,icldm,lcldm,qsfm,qgic,ngic,lamg,n0g,      &
+!$acc               minstgm,ninstgm,pracg,psacwg,nmultg,nmultrg,npracg,nscng,  &
+!$acc               nsagg,nragg,ngracs,npsacwg,prdg,qmultg,qmultrg,ung,agn,    &
+!$acc               dumg,dumng,dum_2D,dum1A,dum2A,dum3A,dumni0A2D,dumns0A2D,   &
+!$acc               ttmpA,esi,esnA,qvl,qvi,qvnA,pgsacw,pgracs,nnuccd,mnuccd,   &
+!$acc               mnudep,nnudep,nimax,minstsm,ninstsm,minstrf,ninstrf,mi0l,  &
+!$acc               arn,asn,acn,ain,ajn,fc,fnc,fi,fni,fg,fng,fr,fnr,fs,fns,    &
+!$acc               esl,relhum,nsubi,nsubc,nsubs,nsubr,berg,bergs,uns,unr,     &
+!$acc               rainrt,vap_dep,ice_sublim,mnuccc,nnuccc,mnucct,nnucct,     &
+!$acc               mnuccr,nnuccr,mnuccri,nnuccri,uns,unr,msacwi,nsacwi,lami,  &
+!$acc               lamc,n0i,lams,n0s,lamr,n0r,psacws,npsacws,pracs,npracs,    &
+!$acc               pgam,prc,nprc,nprc1,pra,npra,prci,nprci,prai,nprai,pre,    &
+!$acc               prds,psacr,ncic,niic,nsic,nric,qiic,qsic,qric,dumi,dumni,  &
+!$acc               dumr,dumnr,dums,dumns,qtmpAI,qvnAI,dumc,dumnc,qcic)
+
+  ! Copies of input concentrations that may be changed internally.
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k = 1,nlev
+     do i = 1,mgncol
+        qc(i,k) = qcn(i,k)
+        nc(i,k) = ncn(i,k)
+        qi(i,k) = qin(i,k)
+        ni(i,k) = nin(i,k)
+        qr(i,k) = qrn(i,k)
+        nr(i,k) = nrn(i,k)
+        qs(i,k) = qsn(i,k)
+        ns(i,k) = nsn(i,k)
+        qg(i,k) = qgr(i,k)
+        ng(i,k) = ngr(i,k)
+     end do
+  end do
+
+  ! cldn: used to set cldm, unused for subcolumns
+  ! liqcldf: used to set lcldm, unused for subcolumns
+  ! icecldf: used to set icldm, unused for subcolumns
+
+  if (microp_uniform) then
+     ! subcolumns, set cloud fraction variables to one
+     ! if cloud water or ice is present, if not present
+     ! set to mincld (mincld used instead of zero, to prevent
+     ! possible division by zero errors).
+
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+       do i=1,mgncol
+          if (qc(i,k) >= qsmall) then
+             lcldm(i,k) = 1._r8
+          else
+             lcldm(i,k) = mincld
+          end if
+
+          if (qi(i,k) >= qsmall) then
+             icldm(i,k) = 1._r8
+          else
+             icldm(i,k) = mincld
+          end if
+
+          cldm(i,k) = max(icldm(i,k), lcldm(i,k))
+          qsfm(i,k) = 1._r8
+        end do
+     end do
+
+  else
+     ! get cloud fraction, check for minimum
+
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+          cldm(i,k) = max(cldn(i,k),mincld)
+          lcldm(i,k) = max(liqcldf(i,k),mincld)
+          icldm(i,k) = max(icecldf(i,k),mincld)
+          qsfm(i,k) = qsatfac(i,k)
+        end do
+     end do
+  end if
+
+  ! Initialize local variables
+  ! local physical properties
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+    do i=1,mgncol
+       rho(i,k) = p(i,k)/(r*t(i,k))
+       dv(i,k) = 8.794E-5_r8 * t(i,k)**1.81_r8 / p(i,k)
+       mu(i,k) = 1.496E-6_r8 * t(i,k)**1.5_r8 / (t(i,k) + 120._r8)
+       sc(i,k) = mu(i,k)/(rho(i,k)*dv(i,k))
+
+       ! air density adjustment for fallspeed parameters
+       ! includes air density correction factor to the
+       ! power of 0.54 following Heymsfield and Bansemer 2007
+     
+       rhof(i,k)=(rhosu/rho(i,k))**0.54_r8
+     
+       arn(i,k)=ar*rhof(i,k)
+       asn(i,k)=as*rhof(i,k)
+       ! Hail use ah*rhof graupel use ag*rhof
+       ! Note that do_hail and do_graupel can't both be true
+       if (do_hail) then
+          agn(i,k) = ah*rhof(i,k)
+       end if
+       if (do_graupel) then
+          agn(i,k) = ag*rhof(i,k)
+       end if
+       acn(i,k)=g*rhow/(18._r8*mu(i,k))
+       ain(i,k)=ai*(rhosu/rho(i,k))**0.35_r8
+       ajn(i,k)=aj*(rhosu/rho(i,k))**0.35_r8
+    end do
+  end do
+  !$acc end parallel
+
+  !cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  ! Get humidity and saturation vapor pressures
+
+  !!call t_startf ('micro_mg3_qsat')
+
+  call qsat_water(t, p, esl, qvl, mgncol*nlev)
+  call qsat_ice(t, p, esi, qvi, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_qsat')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! make sure when above freezing that esi=esl, not active yet
+        if (t(i,k) >= tmelt) then
+           esi(i,k)=esl(i,k)
+           qvi(i,k)=qvl(i,k)
+        else
+           ! Scale the water saturation values to reflect subgrid scale
+           ! ice cloud fraction, where ice clouds begin forming at a
+           ! gridbox average relative humidity of rhmini (not 1).
+           !
+           ! NOTE: For subcolumns and other non-subgrid clouds, qsfm willi
+           ! be 1.
+           qvi(i,k) = qsfm(i,k) * qvi(i,k)
+           esi(i,k) = qsfm(i,k) * esi(i,k)
+           qvl(i,k) = qsfm(i,k) * qvl(i,k)
+           esl(i,k) = qsfm(i,k) * esl(i,k)
+        end if
+        relhum(i,k) = q(i,k) / max(qvl(i,k), qsmall)
+
+     end do
+  end do
+
+  ! initialize microphysics output
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        qcsevap(i,k)=0._r8
+        qisevap(i,k)=0._r8
+        qvres(i,k)  =0._r8
+        cmeitot(i,k) =0._r8
+        vtrmc(i,k) =0._r8
+        vtrmi(i,k) =0._r8
+        qcsedten(i,k) =0._r8
+        qisedten(i,k) =0._r8
+        qrsedten(i,k) =0._r8
+        qssedten(i,k) =0._r8
+        qgsedten(i,k) =0._r8
+      
+        pratot(i,k)=0._r8
+        prctot(i,k)=0._r8
+        mnuccctot(i,k)=0._r8
+        mnuccttot(i,k)=0._r8
+        msacwitot(i,k)=0._r8
+        psacwstot(i,k)=0._r8
+        bergstot(i,k)=0._r8
+        bergtot(i,k)=0._r8
+        melttot(i,k)=0._r8
+        homotot(i,k)=0._r8
+        qcrestot(i,k)=0._r8
+        prcitot(i,k)=0._r8
+        praitot(i,k)=0._r8
+        qirestot(i,k)=0._r8
+        mnuccrtot(i,k)=0._r8
+        mnuccritot(i,k)=0._r8
+        pracstot(i,k)=0._r8
+        meltsdttot(i,k)=0._r8
+        frzrdttot(i,k)=0._r8
+        mnuccdtot(i,k)=0._r8
+        psacrtot(i,k)=0._r8
+        pracgtot(i,k)=0._r8
+        psacwgtot(i,k)=0._r8
+        pgsacwtot(i,k)=0._r8
+        pgracstot(i,k)=0._r8
+        prdgtot(i,k)=0._r8
+        qmultgtot(i,k)=0._r8
+        qmultrgtot(i,k)=0._r8
+        npracgtot(i,k) =0._r8
+        nscngtot(i,k) =0._r8
+        ngracstot(i,k)=0._r8
+        nmultgtot(i,k)=0._r8
+        nmultrgtot(i,k)=0._r8
+        npsacwgtot(i,k)=0._r8
+
+!need to zero these out to be totally switchable (for conservation)
+        psacr(i,k)=0._r8
+        pracg(i,k)=0._r8
+        psacwg(i,k)=0._r8
+        pgsacw(i,k)=0._r8
+        pgracs(i,k)=0._r8
+        prdg(i,k)=0._r8
+        qmultg(i,k)=0._r8
+        qmultrg(i,k)=0._r8
+        npracg(i,k)=0._r8
+        nscng(i,k)=0._r8
+        ngracs(i,k)=0._r8
+        nmultg(i,k)=0._r8
+        nmultrg(i,k)=0._r8
+        npsacwg(i,k)=0._r8
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev+1
+     do i=1,mgncol
+        rflx(i,k)=0._r8
+        sflx(i,k)=0._r8
+        lflx(i,k)=0._r8
+        iflx(i,k)=0._r8
+        gflx(i,k)=0._r8
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! initialize precip output
+        qrout(i,k)=0._r8
+        qsout(i,k)=0._r8
+        nrout(i,k)=0._r8
+        nsout(i,k)=0._r8
+        qgout(i,k)=0._r8
+        ngout(i,k)=0._r8
+
+        ! for refl calc
+        rainrt(i,k) = 0._r8
+      
+        ! initialize rain size
+        rercld(i,k)=0._r8
+      
+        qcsinksum_rate1ord(i,k) = 0._r8
+      
+        ! initialize variables for trop_mozart
+        nevapr(i,k) = 0._r8
+        prer_evap(i,k) = 0._r8
+        evapsnow(i,k) = 0._r8
+        am_evp_st(i,k) = 0._r8
+        prain(i,k) = 0._r8
+        prodsnow(i,k) = 0._r8
+        cmeout(i,k) = 0._r8
+      
+        precip_frac(i,k) = mincld
+        lamc(i,k)=0._r8
+        lamg(i,k)=0._r8
+      
+        ! initialize microphysical tendencies      
+        tlat(i,k)=0._r8
+        qvlat(i,k)=0._r8
+        qctend(i,k)=0._r8
+        qitend(i,k)=0._r8
+        qstend(i,k) = 0._r8
+        qrtend(i,k) = 0._r8
+        nctend(i,k) = 0._r8
+        nitend(i,k) = 0._r8
+        nrtend(i,k) = 0._r8
+        nstend(i,k) = 0._r8
+        qgtend(i,k) = 0._r8
+        ngtend(i,k) = 0._r8
+      
+        ! initialize in-cloud and in-precip quantities to zero
+        qcic(i,k)  = 0._r8
+        qiic(i,k)  = 0._r8
+        qsic(i,k)  = 0._r8
+        qric(i,k)  = 0._r8
+        qgic(i,k)  = 0._r8
+      
+        ncic(i,k)  = 0._r8
+        niic(i,k)  = 0._r8
+        nsic(i,k)  = 0._r8
+        nric(i,k)  = 0._r8
+        ngic(i,k)  = 0._r8
+     end do
+  end do
+
+  ! initialize precip at surface
+
+  !$acc loop gang vector
+  do i=1,mgncol
+     prect(i)  = 0._r8
+     preci(i)  = 0._r8
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! initialize precip fallspeeds to zero
+        ums(i,k) = 0._r8
+        uns(i,k) = 0._r8
+        umr(i,k) = 0._r8
+        unr(i,k) = 0._r8
+        umg(i,k) = 0._r8
+        ung(i,k) = 0._r8
+      
+        ! initialize limiter for output
+        qcrat(i,k) = 1._r8
+      
+        ! Many outputs have to be initialized here at the top to work around
+        ! ifort problems, even if they are always overwritten later.
+        effc(i,k)    = 10._r8
+        lamcrad(i,k) = 0._r8
+        pgamrad(i,k) = 0._r8
+        effc_fn(i,k) = 10._r8
+        effi(i,k)    = 25._r8
+        sadice(i,k)  = 0._r8
+        sadsnow(i,k) = 0._r8
+        deffi(i,k)   = 50._r8
+      
+        qrout2(i,k) = 0._r8
+        nrout2(i,k) = 0._r8
+        drout2(i,k) = 0._r8
+        qsout2(i,k) = 0._r8
+        nsout2(i,k) = 0._r8
+        dsout(i,k)  = 0._r8
+        dsout2(i,k) = 0._r8
+        qgout2(i,k) = 0._r8
+        ngout2(i,k) = 0._r8
+        freqg(i,k) = 0._r8
+        freqr(i,k) = 0._r8
+        freqs(i,k) = 0._r8
+      
+        reff_rain(i,k) = 0._r8
+        reff_snow(i,k) = 0._r8
+        reff_grau(i,k) = 0._r8
+      
+        refl(i,k)   = -9999._r8
+        arefl(i,k)  = 0._r8
+        areflz(i,k) = 0._r8
+        frefl(i,k)  = 0._r8
+        csrfl(i,k)  = 0._r8
+        acsrfl(i,k) = 0._r8
+        fcsrfl(i,k) = 0._r8
+      
+        ncal(i,k)  = 0._r8
+        ncai(i,k)  = 0._r8
+        nfice(i,k) = 0._r8
+
+     end do
+  end do
+
+  !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  ! droplet activation
+  ! get provisional droplet number after activation. This is used for
+  ! all microphysical process calculations, for consistency with update of
+  ! droplet mass before microphysics
+
+  ! calculate potential for droplet activation if cloud water is present
+  ! tendency from activation (npccn) is read in from companion routine
+
+  ! output activated liquid and ice (convert from #/kg -> #/m3)
+  !--------------------------------------------------
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (qc(i,k) >= qsmall) then
+           nc(i,k) = max(nc(i,k) + npccn(i,k)*deltat, 0._r8)
+           ncal(i,k) = nc(i,k)*rho(i,k)/lcldm(i,k) ! sghan minimum in #/cm3
+        else
+           ncal(i,k) = 0._r8
+        end if
+
+        if (t(i,k) < icenuct) then
+           ncai(i,k) = naai(i,k)*rho(i,k)
+        else
+           ncai(i,k) = 0._r8
+        end if 
+    end do
+  end do
+
+  !===============================================
+
+  ! ice nucleation if activated nuclei exist at t<-5C AND rhmini + 5%
+  !
+  ! NOTE: If using gridbox average values, condensation will not occur until rh=1,
+  ! so the threshold seems like it should be 1.05 and not rhmini + 0.05. For subgrid
+  ! clouds (using rhmini and qsfacm), the relhum has already been adjusted, and thus
+  ! the nucleation threshold should also be 1.05 and not rhmini + 0.05.
+  !-------------------------------------------------------
+
+  if (do_cldice) then
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           if (naai(i,k) > 0._r8 .and. t(i,k) < icenuct .and. &
+              relhum(i,k)*esl(i,k)/esi(i,k) > 1.05_r8) then
+
+              !if NAAI > 0. then set numice = naai (as before)
+              !note: this is gridbox averaged
+              nnuccd(i,k) = (naai(i,k)-ni(i,k)/icldm(i,k))/mtime*icldm(i,k)
+              nnuccd(i,k) = max(nnuccd(i,k),0._r8)
+              nimax(i,k) = naai(i,k)*icldm(i,k)
+
+              !Calc mass of new particles using new crystal mass...
+              !also this will be multiplied by mtime as nnuccd is...
+
+              mnuccd(i,k) = nnuccd(i,k) * mi0
+
+           else
+              nnuccd(i,k) = 0._r8
+              nimax(i,k)  = 0._r8
+              mnuccd(i,k) = 0._r8
+           end if
+        end do
+     end do
+  end if
+
+  !=============================================================================
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! calculate instantaneous precip processes (melting and homogeneous freezing)
+        ! melting of snow at +2 C
+
+        if (t(i,k) > snowmelt) then
+           if (qs(i,k) > 0._r8) then
+              ! make sure melting snow doesn't reduce temperature below threshold
+              dum = -xlf/cpp*qs(i,k)
+              if (t(i,k)+dum < snowmelt) then
+                 dum = (t(i,k)-snowmelt)*cpp/xlf
+                 dum = dum/qs(i,k)
+                 dum = max(0._r8,dum)
+                 dum = min(1._r8,dum)
+              else
+                 dum = 1._r8
+              end if
+
+              minstsm(i,k) = dum*qs(i,k)
+              ninstsm(i,k) = dum*ns(i,k)
+
+              dum1=-xlf*minstsm(i,k)*rdeltat
+              tlat(i,k)=tlat(i,k)+dum1
+              meltsdttot(i,k)=meltsdttot(i,k) + dum1
+
+              qs(i,k) = max(qs(i,k) - minstsm(i,k), 0._r8)
+              ns(i,k) = max(ns(i,k) - ninstsm(i,k), 0._r8)
+              qr(i,k) = max(qr(i,k) + minstsm(i,k), 0._r8)
+              nr(i,k) = max(nr(i,k) + ninstsm(i,k), 0._r8)
+           end if
+        end if
+
+     end do
+  end do 
+
+  ! melting of graupel at +2 C`
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i=1,mgncol
+
+        if (t(i,k) > snowmelt) then
+           if (qg(i,k) > 0._r8) then
+
+              ! make sure melting graupel doesn't reduce temperature below threshold
+              dum = -xlf/cpp*qg(i,k)
+              if (t(i,k)+dum < snowmelt) then
+                 dum = (t(i,k)-snowmelt)*cpp/xlf
+                 dum = dum/qg(i,k)
+                 dum = max(0._r8,dum)
+                 dum = min(1._r8,dum)
+              else
+                 dum = 1._r8
+              end if
+
+              minstgm(i,k) = dum*qg(i,k)
+              ninstgm(i,k) = dum*ng(i,k)
+
+              dum1=-xlf*minstgm(i,k)*rdeltat
+              tlat(i,k)=tlat(i,k)+dum1
+              meltsdttot(i,k)=meltsdttot(i,k) + dum1
+
+              qg(i,k) = max(qg(i,k) - minstgm(i,k), 0._r8)
+              ng(i,k) = max(ng(i,k) - ninstgm(i,k), 0._r8)
+              qr(i,k) = max(qr(i,k) + minstgm(i,k), 0._r8)
+              nr(i,k) = max(nr(i,k) + ninstgm(i,k), 0._r8)
+           end if
+        end if
+
+     end do
+  end do 
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+    do i=1,mgncol
+        ! freezing of rain at -5 C
+        if (t(i,k) < rainfrze) then
+           if (qr(i,k) > 0._r8) then
+              ! make sure freezing rain doesn't increase temperature above threshold
+              dum = xlf/cpp*qr(i,k)
+              if (t(i,k)+dum > rainfrze) then
+                 dum = -(t(i,k)-rainfrze)*cpp/xlf
+                 dum = dum/qr(i,k)
+                 dum = max(0._r8,dum)
+                 dum = min(1._r8,dum)
+              else
+                 dum = 1._r8
+              end if
+
+              minstrf(i,k) = dum*qr(i,k)
+              ninstrf(i,k) = dum*nr(i,k)
+
+              ! heating tendency
+              dum1 = xlf*minstrf(i,k)*rdeltat
+              tlat(i,k)=tlat(i,k)+dum1
+              frzrdttot(i,k)=frzrdttot(i,k) + dum1
+
+              qr(i,k) = max(qr(i,k) - minstrf(i,k), 0._r8)
+              nr(i,k) = max(nr(i,k) - ninstrf(i,k), 0._r8)
+
+              ! freeze rain to graupel not snow.
+              if(do_hail.or.do_graupel) then
+                 qg(i,k) = max(qg(i,k) + minstrf(i,k), 0._r8)
+                 ng(i,k) = max(ng(i,k) + ninstrf(i,k), 0._r8)
+              else
+                 qs(i,k) = max(qs(i,k) + minstrf(i,k), 0._r8)
+                 ns(i,k) = max(ns(i,k) + ninstrf(i,k), 0._r8)
+              end if
+           end if
+        end if
+     end do
+  end do 
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+    do i=1,mgncol
+        ! obtain in-cloud values of cloud water/ice mixing ratios and number concentrations
+        !-------------------------------------------------------
+        ! for microphysical process calculations
+        ! units are kg/kg for mixing ratio, 1/kg for number conc
+
+        if (qc(i,k).ge.qsmall) then
+           ! limit in-cloud values to 0.005 kg/kg
+           qcic(i,k)=min(qc(i,k)/lcldm(i,k),5.e-3_r8)
+           ncic(i,k)=max(nc(i,k)/lcldm(i,k),0._r8)
+
+           ! specify droplet concentration
+           if (nccons) then
+              ncic(i,k)=ncnst/rho(i,k)
+           end if
+        else
+           qcic(i,k)=0._r8
+           ncic(i,k)=0._r8
+        end if
+
+        if (qi(i,k).ge.qsmall) then
+           ! limit in-cloud values to 0.005 kg/kg
+           qiic(i,k)=min(qi(i,k)/icldm(i,k),5.e-3_r8)
+           niic(i,k)=max(ni(i,k)/icldm(i,k),0._r8)
+
+           ! switch for specification of cloud ice number
+           if (nicons) then
+              niic(i,k)=ninst/rho(i,k)
+           end if
+        else
+           qiic(i,k)=0._r8
+           niic(i,k)=0._r8
+        end if
+
+     end do
+  end do
+
+  !========================================================================
+
+  ! for sub-columns cldm has already been set to 1 if cloud
+  ! water or ice is present, so precip_frac will be correctly set below
+  ! and nothing extra needs to be done here
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        precip_frac(i,k) = cldm(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !$acc parallel vector_length(VLEN) default(present)
+  if (precip_frac_method == MG_PRECIP_FRAC_INCLOUD) then
+     !$acc loop seq
+     do k=2,nlev
+        !$acc loop gang vector
+        do i=1,mgncol
+           if (qc(i,k) < qsmall .and. qi(i,k) < qsmall) then
+              precip_frac(i,k) = precip_frac(i,k-1)
+           end if
+       end do
+     end do
+
+  else if (precip_frac_method ==  MG_PRECIP_FRAC_OVERLAP) then
+     ! calculate precip fraction based on maximum overlap assumption
+     ! if rain or snow mix ratios are smaller than threshold,
+     ! then leave precip_frac as cloud fraction at current level
+
+     !$acc loop seq
+     do k=2,nlev
+        !$acc loop gang vector
+        do i=1,mgncol
+           if (qr(i,k-1) >= qsmall .or. qs(i,k-1) >= qsmall) then
+              precip_frac(i,k)=max(precip_frac(i,k-1),precip_frac(i,k))
+           end if
+        end do
+     end do
+
+  endif
+  !$acc end parallel
+
+  !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  ! get size distribution parameters based on in-cloud cloud water
+  ! these calculations also ensure consistency between number and mixing ratio
+  !cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+  ! cloud liquid
+  !-------------------------------------------
+
+  !!call t_startf ('micro_mg3_size_dist_param_liq_vect')
+
+  call size_dist_param_liq_vect(mg_liq_props, qcic, ncic, rho, pgam, lamc, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_liq_vect')
+
+  !========================================================================
+  ! autoconversion of cloud liquid water to rain
+  ! formula from Khrouditnov and Kogan (2000), modified for sub-grid distribution of qc
+  ! minimum qc of 1 x 10^-8 prevents floating point error
+
+  if (.not. do_sb_physics) then
+    !!call t_startf ('micro_mg3_kk2000_liq_autoconversion')
+
+    call kk2000_liq_autoconversion(microp_uniform, qcic, ncic, rho, relvar, prc, nprc, nprc1, mgncol*nlev)
+
+    !!call t_stopf ('micro_mg3_kk2000_liq_autoconversion')
+  endif
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! assign qric based on prognostic qr, using assumed precip fraction
+        ! note: this could be moved above for consistency with qcic and qiic calculations
+        qric(i,k) = qr(i,k)/precip_frac(i,k)
+        nric(i,k) = nr(i,k)/precip_frac(i,k)
+
+        ! limit in-precip mixing ratios to 10 g/kg
+        qric(i,k)=min(qric(i,k),0.01_r8)
+
+        ! add autoconversion to precip from above to get provisional rain mixing ratio
+        ! and number concentration (qric and nric)
+        if (qric(i,k).lt.qsmall) then
+           qric(i,k)=0._r8
+           nric(i,k)=0._r8
+        end if
+
+        ! make sure number concentration is a positive number to avoid
+        ! taking root of negative later
+        nric(i,k)=max(nric(i,k),0._r8)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  ! Get size distribution parameters for cloud ice
+  call size_dist_param_basic_vect(mg_ice_props, qiic, niic, lami, mgncol*nlev, n0=n0i)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  ! Alternative autoconversion 
+  if (do_sb_physics) then
+     !!call t_startf ('micro_mg3_sb2001v2_liq_autoconversion')
+
+     call sb2001v2_liq_autoconversion(pgam, qcic, ncic, qric, rho, relvar, prc, nprc, nprc1, mgncol*nlev) 
+
+     !!call t_stopf ('micro_mg3_sb2001v2_liq_autoconversion')
+  end if
+
+  !.......................................................................
+  ! Autoconversion of cloud ice to snow
+  ! similar to Ferrier (1994)
+
+  if (do_cldice) then
+     !!call t_startf ('micro_mg3_ice_autoconversion')
+
+     call ice_autoconversion(t, qiic, lami, n0i, dcs, prci, nprci, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_ice_autoconversion')
+  else
+     ! Add in the particles that we have already converted to snow, and
+     ! don't do any further autoconversion of ice.
+
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           prci(i,k)  = tnd_qsnow(i,k) / cldm(i,k)
+           nprci(i,k) = tnd_nsnow(i,k) / cldm(i,k)
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if
+
+  ! note, currently we don't have this
+  ! inside the do_cldice block, should be changed later
+  ! assign qsic based on prognostic qs, using assumed precip fraction
+
+   !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        qsic(i,k) = qs(i,k)/precip_frac(i,k)
+        nsic(i,k) = ns(i,k)/precip_frac(i,k)
+
+        ! limit in-precip mixing ratios to 10 g/kg
+        qsic(i,k)=min(qsic(i,k),0.01_r8)
+
+        ! if precip mix ratio is zero so should number concentration
+        if (qsic(i,k) < qsmall) then
+           qsic(i,k)=0._r8
+           nsic(i,k)=0._r8
+        end if
+
+        ! make sure number concentration is a positive number to avoid
+        ! taking root of negative later
+        nsic(i,k)=max(nsic(i,k),0._r8)
+
+        ! also do this for graupel, which is assumed to be 'precip_frac'
+        qgic(i,k) = qg(i,k)/precip_frac(i,k)
+        ngic(i,k) = ng(i,k)/precip_frac(i,k)
+
+        ! limit in-precip mixing ratios to 10 g/kg
+        qgic(i,k)=min(qgic(i,k),0.01_r8)
+
+        ! if precip mix ratio is zero so should number concentration
+        if (qgic(i,k) < qsmall) then
+           qgic(i,k)=0._r8
+           ngic(i,k)=0._r8
+        end if
+
+        ! make sure number concentration is a positive number to avoid
+        ! taking root of negative later
+        ngic(i,k)=max(ngic(i,k),0._r8)    
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !.......................................................................
+  ! get size distribution parameters for precip
+  !......................................................................
+  ! rain
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  call size_dist_param_basic_vect(mg_rain_props, qric, nric, lamr, mgncol*nlev, n0=n0r)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (lamr(i,k) >= qsmall) then
+           dum_2D(i,k)= lamr(i,k)**br
+           ! provisional rain number and mass weighted mean fallspeed (m/s)
+           unr(i,k) = min(arn(i,k)*gamma_br_plus1/dum_2D(i,k),9.1_r8*rhof(i,k))
+           umr(i,k) = min(arn(i,k)*gamma_br_plus4/(6._r8*dum_2D(i,k)),9.1_r8*rhof(i,k))
+        else
+           umr(i,k) = 0._r8
+           unr(i,k) = 0._r8
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !......................................................................
+  ! snow
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  call size_dist_param_basic_vect(mg_snow_props, qsic, nsic, lams, mgncol*nlev, n0=n0s)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (lams(i,k) > 0._r8) then
+           dum_2D(i,k) = lams(i,k)**bs
+           ! provisional snow number and mass weighted mean fallspeed (m/s)
+           ums(i,k) = min(asn(i,k)*gamma_bs_plus4/(6._r8*dum_2D(i,k)),1.2_r8*rhof(i,k))
+           uns(i,k) = min(asn(i,k)*gamma_bs_plus1/dum_2D(i,k),1.2_r8*rhof(i,k))
+        else
+           ums(i,k) = 0._r8
+           uns(i,k) = 0._r8
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+!  !......................................................................
+!  !       graupel/hail density set (Hail = 400, Graupel = 500 from M2005)
+!     
+!  if (do_hail) then 
+!     bgtmp = bh 
+!     rhogtmp = rhoh
+!  end if
+!  if (do_graupel) then 
+!     bgtmp = bg
+!     rhogtmp = rhog
+!  end if
+
+  !  graupel/hail size distributions and properties
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  if (do_hail) then
+     call size_dist_param_basic_vect(mg_hail_props, qgic, ngic, lamg, mgncol*nlev, n0=n0g)
+  end if
+  if (do_graupel) then
+     call size_dist_param_basic_vect(mg_graupel_props, qgic, ngic, lamg, mgncol*nlev, n0=n0g)
+  end if
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_misc')
+        
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (lamg(i,k) > 0._r8) then
+           dum_2D(i,k) = lamg(i,k)**bgtmp
+           ! provisional graupel/hail number and mass weighted mean fallspeed (m/s)
+           umg(i,k) = min(agn(i,k)*gamma_bg_plus4/(6._r8*dum_2D(i,k)),20._r8*rhof(i,k))
+           ung(i,k) = min(agn(i,k)*gamma_bg_plus1/dum_2D(i,k),20._r8*rhof(i,k))
+!           umg(i,k) = min(agn(i,k)*gamma(4._r8+bgtmp)/(6._r8*dum_2D(i,k)),20._r8*rhof(i,k))
+!           ung(i,k) = min(agn(i,k)*gamma(1._r8+bgtmp)/dum_2D(i,k),20._r8*rhof(i,k))
+        else
+           umg(i,k) = 0._r8
+           ung(i,k) = 0._r8
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  if (do_cldice) then
+     if (.not. use_hetfrz_classnuc) then
+        ! heterogeneous freezing of cloud water
+        !----------------------------------------------
+        !!call t_startf ('micro_mg3_immersion_freezing')
+
+        call immersion_freezing(microp_uniform, t, pgam, lamc, qcic, ncic, relvar, mnuccc, nnuccc, mgncol*nlev)
+
+        !!call t_stopf ('micro_mg3_immersion_freezing')
+
+        ! make sure number of droplets frozen does not exceed available ice nuclei concentration
+        ! this prevents 'runaway' droplet freezing
+
+        !!call t_startf ('micro_mg3_misc')
+
+        !$acc parallel vector_length(VLEN) default(present)
+        !$acc loop gang vector collapse(2)
+        do k=1,nlev
+           do i=1,mgncol
+              if (qcic(i,k).ge.qsmall .and. t(i,k).lt.269.15_r8 .and. &
+                  nnuccc(i,k)*lcldm(i,k).gt.nnuccd(i,k)) then
+                  ! scale mixing ratio of droplet freezing with limit
+                  mnuccc(i,k)=mnuccc(i,k)*(nnuccd(i,k)/(nnuccc(i,k)*lcldm(i,k)))
+                  nnuccc(i,k)=nnuccd(i,k)/lcldm(i,k)
+              end if
+              mnudep(i,k)=0._r8
+              nnudep(i,k)=0._r8
+           end do
+        end do
+        !$acc end parallel
+
+        !!call t_stopf ('micro_mg3_misc')
+
+        !!call t_startf ('micro_mg3_contact_freezing')
+
+        call contact_freezing(microp_uniform, t, p, rndst, nacon, pgam, lamc, qcic, ncic, &
+                              relvar, mnucct, nnucct, mgncol*nlev, mdust)
+
+        !!call t_stopf ('micro_mg3_contact_freezing')
+     else
+        ! Mass of droplets frozen is the average droplet mass, except
+        ! with two limiters: concentration must be at least 1/cm^3, and
+        ! mass must be at least the minimum defined above.
+
+        !!call t_startf ('micro_mg3_misc')
+
+        !$acc parallel vector_length(VLEN) default(present)
+        !$acc loop gang vector collapse(2)
+        do k=1,nlev
+           do i=1,mgncol
+              mi0l(i,k) = qcic(i,k)/max(ncic(i,k), 1.0e6_r8/rho(i,k))
+              mi0l(i,k) = max(mi0l_min, mi0l(i,k))
+              if (qcic(i,k) >= qsmall) then
+                 nnuccc(i,k) = frzimm(i,k)*1.0e6_r8/rho(i,k)
+                 mnuccc(i,k) = nnuccc(i,k)*mi0l(i,k)
+
+                 nnucct(i,k) = frzcnt(i,k)*1.0e6_r8/rho(i,k)
+                 mnucct(i,k) = nnucct(i,k)*mi0l(i,k)
+
+                 nnudep(i,k) = frzdep(i,k)*1.0e6_r8/rho(i,k)
+                 mnudep(i,k) = nnudep(i,k)*mi0
+              else
+                 nnuccc(i,k) = 0._r8
+                 mnuccc(i,k) = 0._r8
+
+                 nnucct(i,k) = 0._r8
+                 mnucct(i,k) = 0._r8
+
+                 nnudep(i,k) = 0._r8
+                 mnudep(i,k) = 0._r8
+              end if
+           end do
+        end do
+        !$acc end parallel
+
+        !!call t_stopf ('micro_mg3_misc')
+
+     end if
+  else
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           mnuccc(i,k)=0._r8
+           nnuccc(i,k)=0._r8
+           mnucct(i,k)=0._r8
+           nnucct(i,k)=0._r8
+           mnudep(i,k)=0._r8
+           nnudep(i,k)=0._r8
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if
+
+  !!call t_startf ('micro_mg3_snow_self_aggregation')
+
+  call snow_self_aggregation(t, rho, asn, rhosn, qsic, nsic, nsagg, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_snow_self_aggregation')
+
+  !!call t_startf ('micro_mg3_accrete_cloud_water_snow')
+
+  call accrete_cloud_water_snow(t, rho, asn, uns, mu, qcic, ncic, qsic, pgam, &
+                                lamc, lams, n0s, psacws, npsacws, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_accrete_cloud_water_snow')
+
+  if (do_cldice) then
+     !!call t_startf ('micro_mg3_secondary_ice_production')
+
+     call secondary_ice_production(t, psacws, msacwi, nsacwi, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_secondary_ice_production')
+  else
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           nsacwi(i,k) = 0.0_r8
+           msacwi(i,k) = 0.0_r8
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if
+
+  !!call t_startf ('micro_mg3_accrete_rain_snow')
+
+  call accrete_rain_snow(t, rho, umr, ums, unr, uns, qric, qsic, lamr, &
+                         n0r, lams, n0s, pracs, npracs, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_accrete_rain_snow')
+
+  !!call t_startf ('micro_mg3_heterogeneous_rain_freezing')
+
+  call heterogeneous_rain_freezing(t, qric, nric, lamr, mnuccr, nnuccr, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_heterogeneous_rain_freezing')
+
+  if (do_sb_physics) then
+     !!call t_startf ('micro_mg3_sb2001v2_accre_cld_water_rain')
+
+     call sb2001v2_accre_cld_water_rain(qcic, ncic, qric, rho, relvar, pra, npra, mgncol*nlev)     
+
+     !!call t_stopf ('micro_mg3_sb2001v2_accre_cld_water_rain')
+  else
+     !!call t_startf ('micro_mg3_accrete_cloud_water_rain')
+
+     call accrete_cloud_water_rain(microp_uniform, qric, qcic, ncic, relvar, accre_enhan, pra, npra, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_accrete_cloud_water_rain')
+  endif
+
+  !!call t_startf ('micro_mg3_self_collection_rain')
+
+  call self_collection_rain(rho, qric, nric, nragg, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_self_collection_rain')
+
+  if (do_cldice) then
+     !!call t_startf ('micro_mg3_accrete_cloud_ice_snow')
+
+     call accrete_cloud_ice_snow(t, rho, asn, qiic, niic, qsic, lams, n0s, prai, nprai, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_accrete_cloud_ice_snow')
+  else
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           prai(i,k) = 0._r8
+           nprai(i,k) = 0._r8
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if
+
+  !!call t_startf ('micro_mg3_bergeron_process_snow')
+
+  call bergeron_process_snow(t, rho, dv, mu, sc, qvl, qvi, asn, qcic, qsic, lams, n0s, bergs, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_bergeron_process_snow')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        bergs(i,k)=bergs(i,k)*micro_mg_berg_eff_factor
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  if (do_cldice) then
+     !!call t_startf ('micro_mg3_ice_deposition_sublimation')
+
+     call ice_deposition_sublimation(t, q, qi, ni, &
+          icldm, rho, dv, qvl, qvi, &
+          berg, vap_dep, ice_sublim, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_ice_deposition_sublimation')
+
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           berg(i,k)=berg(i,k)*micro_mg_berg_eff_factor
+           
+           if (ice_sublim(i,k) < 0._r8 .and. qi(i,k) > qsmall .and. icldm(i,k) > mincld) then
+              nsubi(i,k) = sublim_factor*ice_sublim(i,k) / qi(i,k) * ni(i,k) / icldm(i,k)
+           else
+              nsubi(i,k) = 0._r8
+           end if
+
+           ! bergeron process should not reduce nc unless
+           ! all ql is removed (which is handled elsewhere)
+           !in fact, nothing in this entire file makes nsubc nonzero.
+           nsubc(i,k) = 0._r8
+
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if !do_cldice
+
+! Process rate calls for graupel   
+!===================================================================
+
+  if (do_hail.or.do_graupel) then
+
+     !!call t_startf ('micro_mg3_evap_graupel')
+
+     call graupel_collecting_snow(qsic, qric, umr, ums, rho, lamr, n0r, lams, n0s, psacr, mgncol*nlev)
+
+     call graupel_collecting_cld_water(qgic, qcic, ncic, rho, n0g, lamg, bgtmp, agn, psacwg, npsacwg, mgncol*nlev)
+     
+     call graupel_riming_liquid_snow(psacws, qsic, qcic, nsic, rho, rhosn, rhogtmp, asn, &
+                                     lams, n0s, deltat, pgsacw, nscng, mgncol*nlev)
+
+     call graupel_collecting_rain(qric, qgic, umg, umr, ung, unr, rho, n0r, &
+                                  lamr, n0g, lamg, pracg, npracg, mgncol*nlev)
+        
+!AG note: Graupel rain riming snow changes  
+!    pracs, npracs, (accretion of rain by snow)  psacr (collection of snow by rain)
+
+     call graupel_rain_riming_snow(pracs, npracs, psacr, qsic, qric, nric, nsic, &
+                                   n0s, lams, n0r, lamr, deltat, pgracs, ngracs, mgncol*nlev)
+   
+     call graupel_rime_splintering(t, qcic, qric, qgic, psacwg, pracg, qmultg, nmultg, qmultrg, nmultrg,mgncol*nlev)
+
+
+     call evaporate_sublimate_precip_graupel(t, rho, dv, mu, sc, q, qvl, qvi, lcldm, precip_frac, arn, asn, agn, &
+                                             bgtmp, qcic, qiic, qric, qsic, qgic, lamr, n0r, lams, n0s, lamg, n0g, &
+                                             pre, prds, prdg, am_evp_st, mgncol*nlev) 
+
+     !!call t_stopf ('micro_mg3_evap_graupel')
+
+  else
+
+     !!call t_startf ('micro_mg3_evap_no_graupel')
+
+     ! Routine without Graupel (original)        
+     call evaporate_sublimate_precip(t, rho, dv, mu, sc, q, qvl, qvi, lcldm, precip_frac, arn, asn, qcic, qiic, &
+                                     qric, qsic, lamr, n0r, lams, n0s, pre, prds, am_evp_st, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_evap_no_graupel')
+
+  end if ! end do_graupel/hail loop
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        ! conservation to ensure no negative values of cloud water/precipitation
+        ! in case microphysical process rates are large
+        !===================================================================
+        ! note: for check on conservation, processes are multiplied by omsm
+        ! to prevent problems due to round off error
+        ! conservation of qc
+        !-------------------------------------------------------------------
+        dum = ((prc(i,k)+pra(i,k)+mnuccc(i,k)+mnucct(i,k)+msacwi(i,k)+ &
+             psacws(i,k)+bergs(i,k)+qmultg(i,k)+psacwg(i,k)+pgsacw(i,k))*lcldm(i,k)+ &
+             berg(i,k))*deltat 
+
+        if (dum.gt.qc(i,k)) then
+           ratio = qc(i,k)*rdeltat/((prc(i,k)+pra(i,k)+mnuccc(i,k)+mnucct(i,k)+ &
+                msacwi(i,k)+psacws(i,k)+bergs(i,k)+qmultg(i,k)+psacwg(i,k)+pgsacw(i,k))*lcldm(i,k)+&
+                berg(i,k))*omsm
+           qmultg(i,k)=qmultg(i,k)*ratio
+           psacwg(i,k)=psacwg(i,k)*ratio
+           pgsacw(i,k)=pgsacw(i,k)*ratio
+           prc(i,k) = prc(i,k)*ratio
+           pra(i,k) = pra(i,k)*ratio
+           mnuccc(i,k) = mnuccc(i,k)*ratio
+           mnucct(i,k) = mnucct(i,k)*ratio
+           msacwi(i,k) = msacwi(i,k)*ratio
+           psacws(i,k) = psacws(i,k)*ratio
+           bergs(i,k) = bergs(i,k)*ratio
+           berg(i,k) = berg(i,k)*ratio
+           qcrat(i,k) = ratio
+        else
+           qcrat(i,k) = 1._r8
+        end if
+
+        !PMC 12/3/12: ratio is also frac of step w/ liquid.
+        !thus we apply berg for "ratio" of timestep and vapor
+        !deposition for the remaining frac of the timestep.
+        if (qc(i,k) >= qsmall) then
+           vap_dep(i,k) = vap_dep(i,k)*(1._r8-qcrat(i,k))
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i=1,mgncol
+        !=================================================================
+        ! apply limiter to ensure that ice/snow sublimation and rain evap
+        ! don't push conditions into supersaturation, and ice deposition/nucleation don't
+        ! push conditions into sub-saturation
+        ! note this is done after qc conservation since we don't know how large
+        ! vap_dep is before then
+        ! estimates are only approximate since other process terms haven't been limited
+        ! for conservation yet
+
+        ! first limit ice deposition/nucleation vap_dep + mnuccd
+        dum1 = vap_dep(i,k) + mnuccd(i,k)
+        if (dum1 > 1.e-20_r8) then
+           dum = (q(i,k)-qvi(i,k))/(1._r8 + xxls_squared*qvi(i,k)/(cpp*rv*t(i,k)**2))*rdeltat
+           dum = max(dum,0._r8)
+           if (dum1 > dum) then
+              ! Allocate the limited "dum" tendency to mnuccd and vap_dep
+              ! processes. Don't divide by cloud fraction; these are grid-
+              ! mean rates.
+              dum1 = mnuccd(i,k) / (vap_dep(i,k)+mnuccd(i,k))
+              mnuccd(i,k) = dum*dum1
+              vap_dep(i,k) = dum - mnuccd(i,k)
+           end if
+        end if
+     end do
+  end do 
+
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        !===================================================================
+        ! conservation of nc
+        !-------------------------------------------------------------------
+        dum = (nprc1(i,k)+npra(i,k)+nnuccc(i,k)+nnucct(i,k)+ &
+             npsacws(i,k)-nsubc(i,k)+npsacwg(i,k))*lcldm(i,k)*deltat
+        if (dum.gt.nc(i,k)) then
+           ratio = nc(i,k)*rdeltat/((nprc1(i,k)+npra(i,k)+nnuccc(i,k)+nnucct(i,k)+&
+                npsacws(i,k)-nsubc(i,k)+npsacwg(i,k))*lcldm(i,k))*omsm
+           npsacwg(i,k)=npsacwg(i,k)*ratio
+           nprc1(i,k) = nprc1(i,k)*ratio
+           npra(i,k) = npra(i,k)*ratio
+           nnuccc(i,k) = nnuccc(i,k)*ratio
+           nnucct(i,k) = nnucct(i,k)*ratio
+           npsacws(i,k) = npsacws(i,k)*ratio
+           nsubc(i,k)=nsubc(i,k)*ratio
+        end if
+        mnuccri(i,k)=0._r8
+        nnuccri(i,k)=0._r8
+        if (do_cldice) then
+           ! freezing of rain to produce ice if mean rain size is smaller than Dcs
+           if (lamr(i,k) > qsmall .and. 1._r8/lamr(i,k) < Dcs) then
+              mnuccri(i,k)=mnuccr(i,k)
+              nnuccri(i,k)=nnuccr(i,k)
+              mnuccr(i,k)=0._r8
+              nnuccr(i,k)=0._r8
+           end if
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        ! conservation of rain mixing ratio
+        !-------------------------------------------------------------------
+        dum = ((-pre(i,k)+pracs(i,k)+mnuccr(i,k)+mnuccri(i,k) &
+             +qmultrg(i,k)+pracg(i,k)+pgracs(i,k))*precip_frac(i,k)- &
+             (pra(i,k)+prc(i,k))*lcldm(i,k))*deltat
+        ! note that qrtend is included below because of instantaneous freezing/melt
+        if (dum.gt.qr(i,k).and. &
+           (-pre(i,k)+pracs(i,k)+mnuccr(i,k)+mnuccri(i,k)+qmultrg(i,k)+pracg(i,k)+pgracs(i,k)).ge.qsmall) then
+           ratio = (qr(i,k)*rdeltat+(pra(i,k)+prc(i,k))*lcldm(i,k))/   &
+                precip_frac(i,k)/(-pre(i,k)+pracs(i,k)+mnuccr(i,k)+mnuccri(i,k) &
+                +qmultrg(i,k)+pracg(i,k)+pgracs(i,k))*omsm
+           qmultrg(i,k)= qmultrg(i,k)*ratio
+           pracg(i,k)=pracg(i,k)*ratio
+           pgracs(i,k)=pgracs(i,k)*ratio
+           pre(i,k)=pre(i,k)*ratio
+           pracs(i,k)=pracs(i,k)*ratio
+           mnuccr(i,k)=mnuccr(i,k)*ratio
+           mnuccri(i,k)=mnuccri(i,k)*ratio
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! conservation of rain number
+        !-------------------------------------------------------------------
+        ! Add evaporation of rain number.
+        if (pre(i,k) < 0._r8) then
+           nsubr(i,k) = pre(i,k)*nr(i,k)/qr(i,k)
+        else
+           nsubr(i,k) = 0._r8
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        dum = ((-nsubr(i,k)+npracs(i,k)+nnuccr(i,k)+nnuccri(i,k)-nragg(i,k)+npracg(i,k)+ngracs(i,k)) &
+             *precip_frac(i,k)- nprc(i,k)*lcldm(i,k))*deltat
+        if (dum.gt.nr(i,k)) then
+           ratio = (nr(i,k)*rdeltat+nprc(i,k)*lcldm(i,k))/precip_frac(i,k)/ &
+                (-nsubr(i,k)+npracs(i,k)+nnuccr(i,k)+nnuccri(i,k)-nragg(i,k)+npracg(i,k)+ngracs(i,k))*omsm
+           npracg(i,k)=npracg(i,k)*ratio
+           ngracs(i,k)=ngracs(i,k)*ratio
+           nragg(i,k)=nragg(i,k)*ratio
+           npracs(i,k)=npracs(i,k)*ratio
+           nnuccr(i,k)=nnuccr(i,k)*ratio
+           nsubr(i,k)=nsubr(i,k)*ratio
+           nnuccri(i,k)=nnuccri(i,k)*ratio
+        end if
+     end do
+  end do
+
+  if (do_cldice) then
+     !$acc loop gang vector collapse(2) private(dum,ratio)
+     do k=1,nlev
+        do i=1,mgncol
+           ! conservation of qi
+           !-------------------------------------------------------------------
+           dum = ((-mnuccc(i,k)-mnucct(i,k)-mnudep(i,k)-msacwi(i,k)-qmultg(i,k))*lcldm(i,k)+(prci(i,k)+ &
+                prai(i,k))*icldm(i,k)+(-qmultrg(i,k)-mnuccri(i,k))*precip_frac(i,k) &
+                -ice_sublim(i,k)-vap_dep(i,k)-berg(i,k)-mnuccd(i,k))*deltat
+           if (dum.gt.qi(i,k)) then
+              ratio = (qi(i,k)*rdeltat+vap_dep(i,k)+berg(i,k)+mnuccd(i,k)+ &
+                   (mnuccc(i,k)+mnucct(i,k)+mnudep(i,k)+msacwi(i,k)+qmultg(i,k))*lcldm(i,k)+ &
+                   (qmultrg(i,k)+mnuccri(i,k))*precip_frac(i,k))/ &
+                   ((prci(i,k)+prai(i,k))*icldm(i,k)-ice_sublim(i,k))*omsm
+              prci(i,k) = prci(i,k)*ratio
+              prai(i,k) = prai(i,k)*ratio
+              ice_sublim(i,k) = ice_sublim(i,k)*ratio
+           end if
+        end do
+     end do
+  end if
+
+  if (do_cldice) then
+     !$acc loop gang vector collapse(2) private(dum,ratio,tmpfrz)
+     do k=1,nlev
+        do i=1,mgncol
+           ! conservation of ni
+           !-------------------------------------------------------------------
+           if (use_hetfrz_classnuc) then
+              tmpfrz = nnuccc(i,k)
+           else
+              tmpfrz = 0._r8
+           end if
+           dum = ((-nnucct(i,k)-tmpfrz-nnudep(i,k)-nsacwi(i,k)-nmultg(i,k))*lcldm(i,k)+(nprci(i,k)+ &
+                nprai(i,k)-nsubi(i,k))*icldm(i,k)+(-nmultrg(i,k)-nnuccri(i,k))*precip_frac(i,k)- &
+                nnuccd(i,k))*deltat
+           if (dum.gt.ni(i,k)) then
+              ratio = (ni(i,k)*rdeltat+nnuccd(i,k)+ &
+                 (nnucct(i,k)+tmpfrz+nnudep(i,k)+nsacwi(i,k)+nmultg(i,k))*lcldm(i,k)+ &
+                 (nnuccri(i,k)+nmultrg(i,k))*precip_frac(i,k))/ &
+                 ((nprci(i,k)+nprai(i,k)-nsubi(i,k))*icldm(i,k))*omsm
+              nprci(i,k) = nprci(i,k)*ratio
+              nprai(i,k) = nprai(i,k)*ratio
+              nsubi(i,k) = nsubi(i,k)*ratio
+           end if
+        end do
+     end do
+  end if
+
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        ! conservation of snow mixing ratio
+        !-------------------------------------------------------------------
+        if (do_hail .or. do_graupel) then
+        ! NOTE: mnuccr is moved to graupel when active
+        ! psacr is a positive value, but a loss for snow
+        !HM: psacr is positive in dum (two negatives)
+           dum = (-(prds(i,k)+pracs(i,k)-psacr(i,k))*precip_frac(i,k)-(prai(i,k)+prci(i,k))*icldm(i,k) &
+             -(bergs(i,k)+psacws(i,k))*lcldm(i,k))*deltat
+        else
+           dum = (-(prds(i,k)+pracs(i,k)+mnuccr(i,k))*precip_frac(i,k)-(prai(i,k)+prci(i,k))*icldm(i,k) &
+             -(bergs(i,k)+psacws(i,k))*lcldm(i,k))*deltat
+        end if 
+
+        if (dum.gt.qs(i,k).and.(psacr(i,k)-prds(i,k)).ge.qsmall) then
+           if (do_hail .or. do_graupel) then        
+              ratio = (qs(i,k)*rdeltat+(prai(i,k)+prci(i,k))*icldm(i,k)+ &
+                   (bergs(i,k)+psacws(i,k))*lcldm(i,k)+pracs(i,k)*precip_frac(i,k))/ &
+                   precip_frac(i,k)/(psacr(i,k)-prds(i,k))*omsm
+              psacr(i,k)=psacr(i,k)*ratio
+           else 
+              ratio = (qs(i,k)*rdeltat+(prai(i,k)+prci(i,k))*icldm(i,k)+ &
+                   (bergs(i,k)+psacws(i,k))*lcldm(i,k)+(pracs(i,k)+mnuccr(i,k))*precip_frac(i,k))/ &
+                   precip_frac(i,k)/(-prds(i,k))*omsm
+           end if
+           prds(i,k)=prds(i,k)*ratio
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(dum,ratio)
+  do k=1,nlev
+     do i=1,mgncol
+        ! conservation of snow number
+        !-------------------------------------------------------------------
+        ! calculate loss of number due to sublimation
+        ! for now neglect sublimation of ns
+        nsubs(i,k)=0._r8
+        if (do_hail .or. do_graupel) then        
+           dum = ((-nsagg(i,k)-nsubs(i,k)+ngracs(i,k))*precip_frac(i,k)-nprci(i,k)*icldm(i,k)-nscng(i,k)*lcldm(i,k))*deltat
+        else
+           dum = ((-nsagg(i,k)-nsubs(i,k)-nnuccr(i,k))*precip_frac(i,k)-nprci(i,k)*icldm(i,k))*deltat
+        end if
+        if (dum.gt.ns(i,k)) then
+           if (do_hail .or. do_graupel) then        
+              ratio = (ns(i,k)*rdeltat+nprci(i,k)*icldm(i,k))/precip_frac(i,k)/ &
+                   (-nsubs(i,k)-nsagg(i,k)+ngracs(i,k)+lcldm(i,k)/precip_frac(i,k)*nscng(i,k))*omsm
+              nscng(i,k)=nscng(i,k)*ratio
+              ngracs(i,k)=ngracs(i,k)*ratio
+           else
+              ratio = (ns(i,k)*rdeltat+nnuccr(i,k)* &
+                   precip_frac(i,k)+nprci(i,k)*icldm(i,k))/precip_frac(i,k)/ &
+                   (-nsubs(i,k)-nsagg(i,k))*omsm
+           endif
+           nsubs(i,k)=nsubs(i,k)*ratio
+           nsagg(i,k)=nsagg(i,k)*ratio
+        end if
+     end do
+  end do
+
+! Graupel Conservation Checks
+!-------------------------------------------------------------------
+
+  if (do_hail.or.do_graupel) then
+     ! conservation of graupel mass
+     !-------------------------------------------------------------------
+     !$acc loop gang vector collapse(2) private(dum,ratio)
+     do k=1,nlev
+        do i=1,mgncol
+           dum= ((-pracg(i,k)-pgracs(i,k)-prdg(i,k)-psacr(i,k)-mnuccr(i,k))*precip_frac(i,k) &
+                + (-psacwg(i,k)-pgsacw(i,k))*lcldm(i,k))*deltat
+           if (dum.gt.qg(i,k)) then
+              ! note: prdg is always negative (like prds), so it needs to be subtracted in ratio
+              ratio = (qg(i,k)*rdeltat + (pracg(i,k)+pgracs(i,k)+psacr(i,k)+mnuccr(i,k))*precip_frac(i,k) &
+                   + (psacwg(i,k)+pgsacw(i,k))*lcldm(i,k)) / ((-prdg(i,k))*precip_frac(i,k))  *omsm
+              prdg(i,k)= prdg(i,k)*ratio
+           end if
+        end do
+     end do
+
+     ! conservation of graupel number: not needed, no sinks
+     !-------------------------------------------------------------------
+  end if
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! next limit ice and snow sublimation and rain evaporation
+        ! get estimate of q and t at end of time step
+        ! don't include other microphysical processes since they haven't
+        ! been limited via conservation checks yet
+        qtmpAI(i,k)=q(i,k)-(ice_sublim(i,k)+vap_dep(i,k)+mnuccd(i,k)+ &
+                (pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k))*deltat
+        ttmpA(i,k)=t(i,k)+((pre(i,k)*precip_frac(i,k))*xxlv+ &
+             ((prds(i,k)+prdg(i,k))*precip_frac(i,k)+vap_dep(i,k)+ice_sublim(i,k)+mnuccd(i,k))*xxls)*deltat/cpp
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_qsat')
+
+  ! use rhw to allow ice supersaturation
+  call qsat_water(ttmpA, p, esnA, qvnAI, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_qsat')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if ((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k) < -1.e-20_r8) then
+           ! modify ice/precip evaporation rate if q > qsat
+           if (qtmpAI(i,k) > qvnAI(i,k)) then
+              dum1A(i,k)=pre(i,k)*precip_frac(i,k)/((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k))
+              dum2A(i,k)=prds(i,k)*precip_frac(i,k)/((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k))
+              dum3A(i,k)=prdg(i,k)*precip_frac(i,k)/((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k))
+              ! recalculate q and t after vap_dep and mnuccd but without evap or sublim
+              ttmpA(i,k)=t(i,k)+((vap_dep(i,k)+mnuccd(i,k))*xxls)*deltat/cpp
+              dum_2D(i,k)=q(i,k)-(vap_dep(i,k)+mnuccd(i,k))*deltat
+           end if
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !!call t_startf ('micro_mg3_qsat')
+
+  ! use rhw to allow ice supersaturation
+  call qsat_water(ttmpA, p, esnA, qvnA, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_qsat')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2) private(dum)
+  do k=1,nlev
+     do i=1,mgncol
+        if ((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k) < -1.e-20_r8) then
+           ! modify ice/precip evaporation rate if q > qsat
+           if (qtmpAI(i,k) > qvnAI(i,k)) then
+              dum=(dum_2D(i,k)-qvnA(i,k))/(1._r8 + xxlv_squared*qvnA(i,k)/(cpp*rv*ttmpA(i,k)**2))
+              dum=min(dum,0._r8)
+              ! modify rates if needed, divide by precip_frac to get local (in-precip) value
+              pre(i,k)=dum*dum1A(i,k)*rdeltat/precip_frac(i,k)
+           end if
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !!call t_startf ('micro_mg3_qsat')
+
+  ! do separately using RHI for prds and ice_sublim
+  call qsat_ice(ttmpA, p, esnA, qvnA, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_qsat')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2) private(dum)
+  do k=1,nlev
+     do i=1,mgncol
+        if ((pre(i,k)+prds(i,k)+prdg(i,k))*precip_frac(i,k)+ice_sublim(i,k) < -1.e-20_r8) then
+           ! modify ice/precip evaporation rate if q > qsat
+           if (qtmpAI(i,k) > qvnAI(i,k)) then
+              dum=(dum_2D(i,k)-qvnA(i,k))/(1._r8 + xxls_squared*qvnA(i,k)/(cpp*rv*ttmpA(i,k)**2))
+              dum=min(dum,0._r8)
+              ! modify rates if needed, divide by precip_frac to get local (in-precip) value
+              prds(i,k) = dum*dum2A(i,k)*rdeltat/precip_frac(i,k)
+              prdg(i,k) = dum*dum3A(i,k)*rdeltat/precip_frac(i,k)
+              ! don't divide ice_sublim by cloud fraction since it is grid-averaged
+              dum1A(i,k) = (1._r8-dum1A(i,k)-dum2A(i,k)-dum3A(i,k))
+              ice_sublim(i,k) = dum*dum1A(i,k)*rdeltat
+           end if
+        end if
+     end do
+  end do
+
+  ! Big "administration" loop enforces conservation, updates variables
+  ! that accumulate over substeps, and sets output variables.
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! get tendencies due to microphysical conversion processes
+        !==========================================================
+        ! note: tendencies are multiplied by appropriate cloud/precip
+        ! fraction to get grid-scale values
+        ! note: vap_dep is already grid-average values
+
+        ! The net tendencies need to be added to rather than overwritten,
+        ! because they may have a value already set for instantaneous
+        ! melting/freezing.
+
+        qvlat(i,k) = qvlat(i,k)-(pre(i,k)+prds(i,k))*precip_frac(i,k)-&
+             vap_dep(i,k)-ice_sublim(i,k)-mnuccd(i,k)-mnudep(i,k)*lcldm(i,k) &
+             -prdg(i,k)*precip_frac(i,k) 
+
+        tlat(i,k) = tlat(i,k)+((pre(i,k)*precip_frac(i,k))*xxlv+ &
+             ((prds(i,k)+prdg(i,k))*precip_frac(i,k)+vap_dep(i,k)+ice_sublim(i,k)+ &
+                 mnuccd(i,k)+mnudep(i,k)*lcldm(i,k))*xxls+ &
+             ((bergs(i,k)+psacws(i,k)+mnuccc(i,k)+mnucct(i,k)+msacwi(i,k)+psacwg(i,k)+ &
+                  qmultg(i,k)+pgsacw(i,k))*lcldm(i,k)+ &
+             (mnuccr(i,k)+pracs(i,k)+mnuccri(i,k)+pracg(i,k)+pgracs(i,k)+qmultrg(i,k))*precip_frac(i,k)+ &
+                  berg(i,k))*xlf)  
+
+        qctend(i,k) = qctend(i,k)+ &
+             (-pra(i,k)-prc(i,k)-mnuccc(i,k)-mnucct(i,k)-msacwi(i,k)- &
+             psacws(i,k)-bergs(i,k)-qmultg(i,k)-psacwg(i,k)-pgsacw(i,k))*lcldm(i,k)-berg(i,k)
+
+
+        if (do_cldice) then
+
+           qitend(i,k) = qitend(i,k)+ &
+              (mnuccc(i,k)+mnucct(i,k)+mnudep(i,k)+msacwi(i,k)+qmultg(i,k))*lcldm(i,k)+(-prci(i,k)- &
+              prai(i,k))*icldm(i,k)+vap_dep(i,k)+berg(i,k)+ice_sublim(i,k)+ &
+              mnuccd(i,k)+(mnuccri(i,k)+qmultrg(i,k))*precip_frac(i,k)
+ 
+        end if
+
+        qrtend(i,k) = qrtend(i,k)+ &
+             (pra(i,k)+prc(i,k))*lcldm(i,k)+(pre(i,k)-pracs(i,k)- &
+             mnuccr(i,k)-mnuccri(i,k)-qmultrg(i,k)-pracg(i,k)-pgracs(i,k))*precip_frac(i,k)
+
+        if (do_hail.or.do_graupel) then
+           qgtend(i,k) = qgtend(i,k) + (pracg(i,k)+pgracs(i,k)+prdg(i,k)+psacr(i,k)+mnuccr(i,k))*precip_frac(i,k) &
+                + (psacwg(i,k)+pgsacw(i,k))*lcldm(i,k)
+
+           qstend(i,k) = qstend(i,k)+ &
+                (prai(i,k)+prci(i,k))*icldm(i,k)+(psacws(i,k)+bergs(i,k))*lcldm(i,k)+(prds(i,k)+ &
+                pracs(i,k)-psacr(i,k))*precip_frac(i,k)
+
+        else
+           !necessary since mnuccr moved to graupel
+           qstend(i,k) = qstend(i,k)+ &
+                (prai(i,k)+prci(i,k))*icldm(i,k)+(psacws(i,k)+bergs(i,k))*lcldm(i,k)+(prds(i,k)+ &
+                pracs(i,k)+mnuccr(i,k))*precip_frac(i,k)
+
+        end if
+
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        cmeout(i,k) = vap_dep(i,k) + ice_sublim(i,k) + mnuccd(i,k)
+
+        ! add output for cmei (accumulate)
+        cmeitot(i,k) = vap_dep(i,k) + ice_sublim(i,k) + mnuccd(i,k)
+
+        !-------------------------------------------------------------------
+        ! evaporation/sublimation is stored here as positive term
+        ! Add to evapsnow via prdg
+        evapsnow(i,k) = (-prds(i,k)-prdg(i,k))*precip_frac(i,k)
+        nevapr(i,k) = -pre(i,k)*precip_frac(i,k)
+        prer_evap(i,k) = -pre(i,k)*precip_frac(i,k)
+
+        ! change to make sure prain is positive: do not remove snow from
+        ! prain used for wet deposition
+
+        prain(i,k) = (pra(i,k)+prc(i,k))*lcldm(i,k)+(-pracs(i,k)- &
+             mnuccr(i,k)-mnuccri(i,k))*precip_frac(i,k)
+        if (do_hail .or. do_graupel) then
+           prodsnow(i,k) = (prai(i,k)+prci(i,k))*icldm(i,k)+(psacws(i,k)+bergs(i,k))*lcldm(i,k)+(&
+                pracs(i,k))*precip_frac(i,k)
+        else
+           prodsnow(i,k) = (prai(i,k)+prci(i,k))*icldm(i,k)+(psacws(i,k)+bergs(i,k))*lcldm(i,k)+(&
+                pracs(i,k)+mnuccr(i,k))*precip_frac(i,k)
+        end if
+
+        ! following are used to calculate 1st order conversion rate of cloud water
+        !    to rain and snow (1/s), for later use in aerosol wet removal routine
+        ! previously, wetdepa used (prain/qc) for this, and the qc in wetdepa may be smaller than the qc
+        !    used to calculate pra, prc, ... in this routine
+        ! qcsinksum_rate1ord = { rate of direct transfer of cloud water to rain & snow }
+        !                      (no cloud ice or bergeron terms)
+
+        qcsinksum_rate1ord(i,k) = (pra(i,k)+prc(i,k)+psacws(i,k)+psacwg(i,k)+pgsacw(i,k))*lcldm(i,k) 
+        ! Avoid zero/near-zero division.
+        qcsinksum_rate1ord(i,k) = qcsinksum_rate1ord(i,k) / &
+             max(qc(i,k),1.0e-30_r8)
+
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! microphysics output, note this is grid-averaged
+        pratot(i,k) = pra(i,k)*lcldm(i,k)
+        prctot(i,k) = prc(i,k)*lcldm(i,k)
+        mnuccctot(i,k) = mnuccc(i,k)*lcldm(i,k)
+        mnuccttot(i,k) = mnucct(i,k)*lcldm(i,k)
+        msacwitot(i,k) = msacwi(i,k)*lcldm(i,k)
+        psacwstot(i,k) = psacws(i,k)*lcldm(i,k)
+        bergstot(i,k) = bergs(i,k)*lcldm(i,k)
+        bergtot(i,k) = berg(i,k)
+        prcitot(i,k) = prci(i,k)*icldm(i,k)
+        praitot(i,k) = prai(i,k)*icldm(i,k)
+        mnuccdtot(i,k) = mnuccd(i,k)*icldm(i,k)
+
+        pracstot(i,k) = pracs(i,k)*precip_frac(i,k)
+        mnuccrtot(i,k) = mnuccr(i,k)*precip_frac(i,k)
+        mnuccritot(i,k) = mnuccri(i,k)*precip_frac(i,k)
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        psacrtot(i,k) = psacr(i,k)*precip_frac(i,k)
+        pracgtot(i,k) = pracg(i,k)*precip_frac(i,k)
+        psacwgtot(i,k) = psacwg(i,k)*lcldm(i,k)
+        pgsacwtot(i,k) = pgsacw(i,k)*lcldm(i,k)
+        pgracstot(i,k) = pgracs(i,k)*precip_frac(i,k)
+        prdgtot(i,k) = prdg(i,k)*precip_frac(i,k)
+        qmultgtot(i,k) = qmultg(i,k)*lcldm(i,k)
+        qmultrgtot(i,k) = qmultrg(i,k)*precip_frac(i,k)
+        npracgtot(i,k) = npracg(i,k)*precip_frac(i,k) 
+        nscngtot(i,k) = nscng(i,k)*lcldm(i,k) 
+        ngracstot(i,k) = ngracs(i,k)*precip_frac(i,k)
+        nmultgtot(i,k) = nmultg(i,k)*lcldm(i,k)
+        nmultrgtot(i,k) = nmultrg(i,k)*precip_frac(i,k)
+        npsacwgtot(i,k) = npsacwg(i,k)*lcldm(i,k)
+
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(tmpfrz)
+  do k=1,nlev
+     do i=1,mgncol
+
+        nctend(i,k) = nctend(i,k)+&
+             (-nnuccc(i,k)-nnucct(i,k)-npsacws(i,k)+nsubc(i,k) &
+             -npra(i,k)-nprc1(i,k)-npsacwg(i,k))*lcldm(i,k)
+
+        if (do_cldice) then
+           if (use_hetfrz_classnuc) then
+              tmpfrz = nnuccc(i,k)
+           else
+              tmpfrz = 0._r8
+           end if
+
+           nitend(i,k) = nitend(i,k)+ nnuccd(i,k)+ &
+                (nnucct(i,k)+tmpfrz+nnudep(i,k)+nsacwi(i,k)+nmultg(i,k))*lcldm(i,k)+(nsubi(i,k)-nprci(i,k)- &
+                nprai(i,k))*icldm(i,k)+(nnuccri(i,k)+nmultrg(i,k))*precip_frac(i,k)
+
+        end if
+
+        if(do_graupel.or.do_hail) then
+
+           nstend(i,k) = nstend(i,k)+(nsubs(i,k)+ &
+                nsagg(i,k)-ngracs(i,k))*precip_frac(i,k)+nprci(i,k)*icldm(i,k)-nscng(i,k)*lcldm(i,k)
+           ngtend(i,k) = ngtend(i,k)+nscng(i,k)*lcldm(i,k)+(ngracs(i,k)+nnuccr(i,k))*precip_frac(i,k)
+
+        else
+           !necessary since mnuccr moved to graupel
+           nstend(i,k) = nstend(i,k)+(nsubs(i,k)+ &
+                nsagg(i,k)+nnuccr(i,k))*precip_frac(i,k)+nprci(i,k)*icldm(i,k)
+        end if
+
+        nrtend(i,k) = nrtend(i,k)+ &
+             nprc(i,k)*lcldm(i,k)+(nsubr(i,k)-npracs(i,k)-nnuccr(i,k) &
+             -nnuccri(i,k)+nragg(i,k)-npracg(i,k)-ngracs(i,k))*precip_frac(i,k)
+
+        ! make sure that ni at advanced time step does not exceed
+        ! maximum (existing N + source terms*dt), which is possible if mtime < deltat
+        ! note that currently mtime = deltat
+        !================================================================
+
+        if (do_cldice .and. nitend(i,k).gt.0._r8.and.ni(i,k)+nitend(i,k)*deltat.gt.nimax(i,k)) then
+           nitend(i,k)=max(0._r8,(nimax(i,k)-ni(i,k))*rdeltat)
+        end if
+
+     end do
+  end do
+
+  ! End of "administration" loop
+
+  !-----------------------------------------------------
+  ! convert rain/snow q and N for output to history, note,
+  ! output is for gridbox average
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        qrout(i,k) = qr(i,k)
+        nrout(i,k) = nr(i,k) * rho(i,k)
+        qsout(i,k) = qs(i,k)
+        nsout(i,k) = ns(i,k) * rho(i,k)
+        qgout(i,k) = qg(i,k)
+        ngout(i,k) = ng(i,k) * rho(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  ! calculate n0r and lamr from rain mass and number
+  ! divide by precip fraction to get in-precip (local) values of
+  ! rain mass and number, divide by rhow to get rain number in kg^-1
+  call size_dist_param_basic_vect(mg_rain_props, qric, nric, lamr, mgncol*nlev, n0=n0r)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_calc_rercld')
+
+  ! Calculate rercld
+  ! calculate mean size of combined rain and cloud water
+  call calc_rercld(lamr, n0r, lamc, pgam, qric, qcic, ncic, rercld, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_calc_rercld')
+
+  ! Assign variables back to start-of-timestep values
+  ! Some state variables are changed before the main microphysics loop
+  ! to make "instantaneous" adjustments. Afterward, we must move those changes
+  ! back into the tendencies.
+  ! These processes:
+  !  - Droplet activation (npccn, impacts nc)
+  !  - Instantaneous snow melting  (minstsm/ninstsm, impacts qr/qs/nr/ns)
+  !  - Instantaneous rain freezing (minstfr/ninstrf, impacts qr/qs/nr/ns)
+  !================================================================================
+
+  ! Re-apply droplet activation tendency
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        nc(i,k) = ncn(i,k)
+        nctend(i,k) = nctend(i,k) + npccn(i,k)
+
+        ! Re-apply rain freezing and snow melting.
+        dum_2D(i,k) = qs(i,k)
+        qs(i,k) = qsn(i,k)
+        qstend(i,k) = qstend(i,k) + (dum_2D(i,k)-qs(i,k))*rdeltat
+      
+        dum_2D(i,k) = ns(i,k)
+        ns(i,k) = nsn(i,k)
+        nstend(i,k) = nstend(i,k) + (dum_2D(i,k)-ns(i,k))*rdeltat
+      
+        dum_2D(i,k) = qr(i,k)
+        qr(i,k) = qrn(i,k)
+        qrtend(i,k) = qrtend(i,k) + (dum_2D(i,k)-qr(i,k))*rdeltat
+      
+        dum_2D(i,k) = nr(i,k)
+        nr(i,k) = nrn(i,k)
+        nrtend(i,k) = nrtend(i,k) + (dum_2D(i,k)-nr(i,k))*rdeltat
+
+        ! Re-apply graupel freezing/melting
+        dum_2D(i,k) = qg(i,k)
+        qg(i,k) = qgr(i,k)
+        qgtend(i,k) = qgtend(i,k) + (dum_2D(i,k)-qg(i,k))*rdeltat
+      
+        dum_2D(i,k) = ng(i,k)
+        ng(i,k) = ngr(i,k)
+        ngtend(i,k) = ngtend(i,k) + (dum_2D(i,k)-ng(i,k))*rdeltat
+
+        !.............................................................................
+        !================================================================================
+      
+        ! modify to include snow. in prain & evap (diagnostic here: for wet dep)
+        nevapr(i,k) = nevapr(i,k) + evapsnow(i,k)
+        prain(i,k) = prain(i,k) + prodsnow(i,k)
+
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! calculate sedimentation for cloud water and ice
+        ! and Graupel (mg3)
+        !================================================================================
+
+        ! update in-cloud cloud mixing ratio and number concentration
+        ! with microphysical tendencies to calculate sedimentation, assign to dummy vars
+        ! note: these are in-cloud values***, hence we divide by cloud fraction
+
+        dumc(i,k) = (qc(i,k)+qctend(i,k)*deltat)/lcldm(i,k)
+        dumi(i,k) = (qi(i,k)+qitend(i,k)*deltat)/icldm(i,k)
+        dumnc(i,k) = max((nc(i,k)+nctend(i,k)*deltat)/lcldm(i,k),0._r8)
+        dumni(i,k) = max((ni(i,k)+nitend(i,k)*deltat)/icldm(i,k),0._r8)
+
+        dumr(i,k) = (qr(i,k)+qrtend(i,k)*deltat)/precip_frac(i,k)
+        dumnr(i,k) = max((nr(i,k)+nrtend(i,k)*deltat)/precip_frac(i,k),0._r8)
+        dums(i,k) = (qs(i,k)+qstend(i,k)*deltat)/precip_frac(i,k)
+        dumns(i,k) = max((ns(i,k)+nstend(i,k)*deltat)/precip_frac(i,k),0._r8)
+
+        dumg(i,k) = (qg(i,k)+qgtend(i,k)*deltat)/precip_frac(i,k)
+        dumng(i,k) = max((ng(i,k)+ngtend(i,k)*deltat)/precip_frac(i,k),0._r8)
+
+        ! switch for specification of droplet and crystal number
+        if (ngcons) then
+           dumng(i,k)=ngnst/rho(i,k)
+        end if
+
+        ! switch for specification of droplet and crystal number
+        if (nccons) then
+           dumnc(i,k)=ncnst/rho(i,k)
+        end if
+
+        ! switch for specification of cloud ice number
+        if (nicons) then
+           dumni(i,k)=ninst/rho(i,k)
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  ! obtain new slope parameter to avoid possible singularity
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  call size_dist_param_basic_vect(mg_ice_props, dumi, dumni, lami, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_size_dist_param_liq_vect')
+
+  call size_dist_param_liq_vect(mg_liq_props, dumc, dumnc, rho, pgam, lamc, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_liq_vect')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2) private(dum1,dum2,dum3,dum4)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! calculate number and mass weighted fall velocity for droplets and cloud ice
+        !-------------------------------------------------------------------
+        if (dumc(i,k).ge.qsmall) then
+           dum1 = 4._r8+bc+pgam(i,k)
+           dum2 = pgam(i,k)+4._r8
+           dum3 = 1._r8+bc+pgam(i,k)
+           dum4 = pgam(i,k)+1._r8
+
+           vtrmc(i,k)=acn(i,k)*gamma(dum1)/(lamc(i,k)**bc*gamma(dum2))
+
+           fc(i,k) = g*rho(i,k)*vtrmc(i,k)
+
+           fnc(i,k) = g*rho(i,k)* &
+                acn(i,k)*gamma(dum3)/ &
+                (lamc(i,k)**bc*gamma(dum4))
+        else
+           fc(i,k) = 0._r8
+           fnc(i,k)= 0._r8
+        end if
+
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2) private(irad,ifrac)
+  do k=1,nlev
+     do i=1,mgncol
+
+        ! calculate number and mass weighted fall velocity for cloud ice
+        if (dumi(i,k).ge.qsmall) then
+
+           vtrmi(i,k)=min(ain(i,k)*gamma_bi_plus4/(6._r8*lami(i,k)**bi), &
+                1.2_r8*rhof(i,k))
+
+           fi(i,k) = g*rho(i,k)*vtrmi(i,k)
+           fni(i,k) = g*rho(i,k)* &
+                min(ain(i,k)*gamma_bi_plus1/lami(i,k)**bi,1.2_r8*rhof(i,k))
+
+           ! adjust the ice fall velocity for smaller (r < 20 um) ice
+           ! particles (blend over 8-20 um)
+           irad = 1.5_r8 / lami(i,k) * 1e6_r8
+           ifrac = min(1._r8, max(0._r8, (irad - 18._r8) / 2._r8))
+ 
+           if (ifrac .lt. 1._r8) then
+              vtrmi(i,k) = ifrac * vtrmi(i,k) + & 
+                 (1._r8 - ifrac) * &
+                 min(ajn(i,k)*gamma_bj_plus4/(6._r8*lami(i,k)**bj), &
+                 1.2_r8*rhof(i,k))
+
+              fi(i,k) = g*rho(i,k)*vtrmi(i,k)
+              fni(i,k) = ifrac * fni(i,k) + & 
+                 (1._r8 - ifrac) * &
+                 g*rho(i,k)* &
+                 min(ajn(i,k)*gamma_bj_plus1/lami(i,k)**bj,1.2_r8*rhof(i,k))
+           end if
+        else
+           fi(i,k) = 0._r8
+           fni(i,k)= 0._r8
+        end if
+
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  ! fallspeed for rain
+  call size_dist_param_basic_vect(mg_rain_props, dumr, dumnr, lamr, mgncol*nlev)
+  ! fallspeed for snow
+  call size_dist_param_basic_vect(mg_snow_props, dums, dumns, lams, mgncol*nlev)
+  ! fallspeed for graupel
+  if (do_hail) then
+     call size_dist_param_basic_vect(mg_hail_props, dumg, dumng, lamg, mgncol*nlev)
+  end if
+  if (do_graupel) then
+     call size_dist_param_basic_vect(mg_graupel_props, dumg, dumng, lamg, mgncol*nlev)
+  end if
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (lamr(i,k).ge.qsmall) then
+           qtmp = lamr(i,k)**br
+           ! 'final' values of number and mass weighted mean fallspeed for rain (m/s)
+           unr(i,k) = min(arn(i,k)*gamma_br_plus1/qtmp,9.1_r8*rhof(i,k))
+           fnr(i,k) = g*rho(i,k)*unr(i,k)
+
+           umr(i,k) = min(arn(i,k)*gamma_br_plus4/(6._r8*qtmp),9.1_r8*rhof(i,k))
+           fr(i,k) = g*rho(i,k)*umr(i,k)
+        else
+           fr(i,k)=0._r8
+           fnr(i,k)=0._r8
+        end if
+
+        if (lams(i,k).ge.qsmall) then
+           qtmp = lams(i,k)**bs
+           ! 'final' values of number and mass weighted mean fallspeed for snow (m/s)
+           ums(i,k) = min(asn(i,k)*gamma_bs_plus4/(6._r8*qtmp),1.2_r8*rhof(i,k))
+           fs(i,k) = g*rho(i,k)*ums(i,k)
+
+           uns(i,k) = min(asn(i,k)*gamma_bs_plus1/qtmp,1.2_r8*rhof(i,k))
+           fns(i,k) = g*rho(i,k)*uns(i,k)
+        else
+           fs(i,k)=0._r8
+           fns(i,k)=0._r8
+        end if
+
+        if (lamg(i,k).ge.qsmall) then
+           ! 'final' values of number and mass weighted mean fallspeed for graupel (m/s)
+           umg(i,k) = min(agn(i,k)*gamma_bg_plus4/(6._r8*lamg(i,k)**bgtmp),20._r8*rhof(i,k))
+!           umg(i,k) = min(agn(i,k)*gamma(4._r8+bgtmp)/(6._r8*lamg(i,k)**bgtmp),20._r8*rhof(i,k))
+           fg(i,k) = g*rho(i,k)*umg(i,k)
+
+           ung(i,k) = min(agn(i,k)*gamma_bg_plus1/lamg(i,k)**bgtmp,20._r8*rhof(i,k))
+!           ung(i,k) = min(agn(i,k)*gamma(1._r8+bgtmp)/lamg(i,k)**bgtmp,20._r8*rhof(i,k))
+           fng(i,k) = g*rho(i,k)*ung(i,k)
+        else
+           fg(i,k)=0._r8
+           fng(i,k)=0._r8
+        end if
+
+        pdel_inv(i,k) = 1._r8/pdel(i,k)
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! redefine dummy variables - sedimentation is calculated over grid-scale
+        ! quantities to ensure conservation
+
+        dumc(i,k) = (qc(i,k)+qctend(i,k)*deltat)
+        dumnc(i,k) = max((nc(i,k)+nctend(i,k)*deltat),0._r8)
+        dumi(i,k) = (qi(i,k)+qitend(i,k)*deltat)
+        dumni(i,k) = max((ni(i,k)+nitend(i,k)*deltat),0._r8)
+        dumr(i,k) = (qr(i,k)+qrtend(i,k)*deltat)
+        dumnr(i,k) = max((nr(i,k)+nrtend(i,k)*deltat),0._r8)
+        dums(i,k) = (qs(i,k)+qstend(i,k)*deltat)
+        dumns(i,k) = max((ns(i,k)+nstend(i,k)*deltat),0._r8)
+        dumg(i,k) = (qg(i,k)+qgtend(i,k)*deltat)
+        dumng(i,k) = max((ng(i,k)+ngtend(i,k)*deltat),0._r8)
+
+        if (dumc(i,k).lt.qsmall) dumnc(i,k)=0._r8
+        if (dumi(i,k).lt.qsmall) dumni(i,k)=0._r8
+        if (dumr(i,k).lt.qsmall) dumnr(i,k)=0._r8
+        if (dums(i,k).lt.qsmall) dumns(i,k)=0._r8
+        if (dumg(i,k).lt.qsmall) dumng(i,k)=0._r8
+     end do
+  end do
+  !$acc end parallel
+
+  ! begin sedimentation
+
+  !!call t_startf ('micro_mg3_sedimentation_ice')
+  ! ice
+  call Sedimentation(mgncol,nlev,do_cldice,deltat,fi,fni,pdel_inv, &
+                     qitend,nitend,qisedten,dumi,dumni,prect,iflx, &
+                     xxlx=xxls,qxsevap=qisevap,tlat=tlat,qvlat=qvlat, &
+                     xcldm=icldm,preci=preci)
+  !!call t_stopf ('micro_mg3_sedimentation_ice')
+
+  !!call t_startf ('micro_mg3_sedimentation_liq')
+  ! liq
+  call Sedimentation(mgncol,nlev,.TRUE.,deltat,fc,fnc,pdel_inv, &
+                     qctend,nctend,qcsedten,dumc,dumnc,prect,lflx, &
+                     xxlx=xxlv,qxsevap=qcsevap,tlat=tlat,qvlat=qvlat,xcldm=lcldm)
+  !!call t_stopf ('micro_mg3_sedimentation_liq')
+
+  !!call t_startf ('micro_mg3_sedimentation_rain')
+  ! rain
+  call Sedimentation(mgncol,nlev,.TRUE.,deltat,fr,fnr,pdel_inv, &
+                     qrtend,nrtend,qrsedten,dumr,dumnr,prect,rflx)
+  !!call t_stopf ('micro_mg3_sedimentation_rain')
+
+  !!call t_startf ('micro_mg3_sedimentation_snow')
+  ! snow
+  call Sedimentation(mgncol,nlev,.TRUE.,deltat,fs,fns,pdel_inv, &
+                     qstend,nstend,qssedten,dums,dumns,prect,sflx,preci=preci)
+  !!call t_stopf ('micro_mg3_sedimentation_snow')
+
+  !!call t_startf ('micro_mg3_sedimentation_graupel')
+  ! graupel
+  call Sedimentation(mgncol,nlev,.TRUE.,deltat,fg,fng,pdel_inv, &
+                     qgtend,ngtend,qgsedten,dumg,dumng,prect,gflx,preci=preci)
+  !!call t_stopf ('micro_mg3_sedimentation_graupel')
+
+  ! end sedimentation
+
+  !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+  ! get new update for variables that includes sedimentation tendency
+  ! note : here dum variables are grid-average, NOT in-cloud
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dumc(i,k) = max(qc(i,k)+qctend(i,k)*deltat,0._r8)
+        dumi(i,k) = max(qi(i,k)+qitend(i,k)*deltat,0._r8)
+        dumnc(i,k) = max(nc(i,k)+nctend(i,k)*deltat,0._r8)
+        dumni(i,k) = max(ni(i,k)+nitend(i,k)*deltat,0._r8)
+
+        dumr(i,k) = max(qr(i,k)+qrtend(i,k)*deltat,0._r8)
+        dumnr(i,k) = max(nr(i,k)+nrtend(i,k)*deltat,0._r8)
+        dums(i,k) = max(qs(i,k)+qstend(i,k)*deltat,0._r8)
+        dumns(i,k) = max(ns(i,k)+nstend(i,k)*deltat,0._r8)
+        dumg(i,k) = max(qg(i,k)+qgtend(i,k)*deltat,0._r8)
+        dumng(i,k) = max(ng(i,k)+ngtend(i,k)*deltat,0._r8)
+
+        ! switch for specification of droplet and crystal number
+        if (nccons) then
+           dumnc(i,k)=ncnst/rho(i,k)*lcldm(i,k)
+        end if
+
+        ! switch for specification of cloud ice number
+        if (nicons) then
+           dumni(i,k)=ninst/rho(i,k)*icldm(i,k)
+        end if
+        
+        ! switch for specification of graupel number
+        if (ngcons) then
+           dumng(i,k)=ngnst/rho(i,k)*precip_frac(i,k)
+        end if
+
+        if (dumc(i,k).lt.qsmall) dumnc(i,k)=0._r8
+        if (dumi(i,k).lt.qsmall) dumni(i,k)=0._r8
+        if (dumr(i,k).lt.qsmall) dumnr(i,k)=0._r8
+        if (dums(i,k).lt.qsmall) dumns(i,k)=0._r8
+        if (dumg(i,k).lt.qsmall) dumng(i,k)=0._r8
+     end do
+  end do
+
+  ! calculate instantaneous processes (melting, homogeneous freezing)
+  !====================================================================
+  ! melting of snow at +2 C
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i=1,mgncol
+        if (t(i,k)+tlat(i,k)/cpp*deltat > snowmelt) then
+           if (dums(i,k) > 0._r8) then
+              ! make sure melting snow doesn't reduce temperature below threshold
+              dum = -xlf/cpp*dums(i,k)
+              if (t(i,k)+tlat(i,k)/cpp*deltat+dum.lt. snowmelt) then
+                 dum = (t(i,k)+tlat(i,k)/cpp*deltat-snowmelt)*cpp/xlf
+                 dum = dum/dums(i,k)
+                 dum = max(0._r8,dum)
+                 dum = min(1._r8,dum)
+              else
+                 dum = 1._r8
+              end if
+
+              qstend(i,k)=qstend(i,k)-dum*dums(i,k)*rdeltat
+              nstend(i,k)=nstend(i,k)-dum*dumns(i,k)*rdeltat
+              qrtend(i,k)=qrtend(i,k)+dum*dums(i,k)*rdeltat
+              nrtend(i,k)=nrtend(i,k)+dum*dumns(i,k)*rdeltat
+
+              dum1=-xlf*dum*dums(i,k)*rdeltat
+              tlat(i,k)=tlat(i,k)+dum1
+              meltsdttot(i,k)=meltsdttot(i,k) + dum1
+           end if
+        end if
+     end do
+  end do
+
+  ! melting of graupel at +2 C
+
+  !$acc loop gang vector collapse(2) private(dum,dum1) 
+  do k=1,nlev
+     do i=1,mgncol
+        if (t(i,k)+tlat(i,k)/cpp*deltat > snowmelt) then
+           if (dumg(i,k) > 0._r8) then
+
+              ! make sure melting graupel doesn't reduce temperature below threshold
+              dum = -xlf/cpp*dumg(i,k)
+              if (t(i,k)+tlat(i,k)/cpp*deltat+dum.lt. snowmelt) then
+                 dum = (t(i,k)+tlat(i,k)/cpp*deltat-snowmelt)*cpp/xlf
+                 dum = dum/dumg(i,k)
+                 dum = max(0._r8,dum)
+                 dum = min(1._r8,dum)
+              else
+                 dum = 1._r8
+              end if
+
+              qgtend(i,k)=qgtend(i,k)-dum*dumg(i,k)*rdeltat
+              ngtend(i,k)=ngtend(i,k)-dum*dumng(i,k)*rdeltat
+              qrtend(i,k)=qrtend(i,k)+dum*dumg(i,k)*rdeltat
+              nrtend(i,k)=nrtend(i,k)+dum*dumng(i,k)*rdeltat
+
+              dum1=-xlf*dum*dumg(i,k)*rdeltat
+              tlat(i,k)=tlat(i,k)+dum1
+              meltsdttot(i,k)=meltsdttot(i,k) + dum1
+           end if
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  ! get mean size of rain = 1/lamr, add frozen rain to either snow or cloud ice
+  ! depending on mean rain size
+  ! add to graupel if using that option....
+  call size_dist_param_basic_vect(mg_rain_props, dumr, dumnr, lamr, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i=1,mgncol
+
+       ! freezing of rain at -5 C
+
+       if (t(i,k)+tlat(i,k)/cpp*deltat < rainfrze) then
+          if (dumr(i,k) > 0._r8) then
+
+             ! make sure freezing rain doesn't increase temperature above threshold
+             dum = xlf/cpp*dumr(i,k)
+             if (t(i,k)+tlat(i,k)/cpp*deltat+dum.gt.rainfrze) then
+                dum = -(t(i,k)+tlat(i,k)/cpp*deltat-rainfrze)*cpp/xlf
+                dum = dum/dumr(i,k)
+                dum = max(0._r8,dum)
+                dum = min(1._r8,dum)
+             else
+                dum = 1._r8
+             end if
+
+             qrtend(i,k)=qrtend(i,k)-dum*dumr(i,k)*rdeltat
+             nrtend(i,k)=nrtend(i,k)-dum*dumnr(i,k)*rdeltat
+
+             if (lamr(i,k) < 1._r8/Dcs) then
+
+                if(do_hail.or.do_graupel) then
+                   qgtend(i,k)=qgtend(i,k)+dum*dumr(i,k)*rdeltat
+                   ngtend(i,k)=ngtend(i,k)+dum*dumnr(i,k)*rdeltat
+                else
+                   qstend(i,k)=qstend(i,k)+dum*dumr(i,k)*rdeltat
+                   nstend(i,k)=nstend(i,k)+dum*dumnr(i,k)*rdeltat
+                end if
+
+             else
+                qitend(i,k)=qitend(i,k)+dum*dumr(i,k)*rdeltat
+                nitend(i,k)=nitend(i,k)+dum*dumnr(i,k)*rdeltat
+             end if
+
+             ! heating tendency
+             dum1 = xlf*dum*dumr(i,k)*rdeltat
+             frzrdttot(i,k)=frzrdttot(i,k) + dum1
+             tlat(i,k)=tlat(i,k)+dum1
+
+          end if
+       end if
+
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  if (do_cldice) then
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2) private(dum)
+     do k=1,nlev
+        do i=1,mgncol
+           if (t(i,k)+tlat(i,k)/cpp*deltat > tmelt) then
+              if (dumi(i,k) > 0._r8) then
+
+                 ! limit so that melting does not push temperature below freezing
+                 !-----------------------------------------------------------------
+                 dum = -dumi(i,k)*xlf/cpp
+                 if (t(i,k)+tlat(i,k)/cpp*deltat+dum.lt.tmelt) then
+                    dum = (t(i,k)+tlat(i,k)/cpp*deltat-tmelt)*cpp/xlf
+                    dum = dum/dumi(i,k)
+                    dum = max(0._r8,dum)
+                    dum = min(1._r8,dum)
+                 else
+                    dum = 1._r8
+                 end if
+
+                 qctend(i,k)=qctend(i,k)+dum*dumi(i,k)*rdeltat
+
+                 ! for output
+                 melttot(i,k)=dum*dumi(i,k)*rdeltat
+
+                 ! assume melting ice produces droplet
+                 ! mean volume radius of 8 micron
+
+                 nctend(i,k)=nctend(i,k)+3._r8*dum*dumi(i,k)*rdeltat/ &
+                      (4._r8*pi*5.12e-16_r8*rhow)
+
+                 qitend(i,k)=((1._r8-dum)*dumi(i,k)-qi(i,k))*rdeltat
+                 nitend(i,k)=((1._r8-dum)*dumni(i,k)-ni(i,k))*rdeltat
+                 tlat(i,k)=tlat(i,k)-xlf*dum*dumi(i,k)*rdeltat
+              end if
+           end if
+        end do
+     end do
+
+     ! homogeneously freeze droplets at -40 C
+     !-----------------------------------------------------------------
+
+     !$acc loop gang vector collapse(2) private(dum)
+     do k=1,nlev
+        do i=1,mgncol
+           if (t(i,k)+tlat(i,k)/cpp*deltat < 233.15_r8) then
+              if (dumc(i,k) > 0._r8) then
+
+                 ! limit so that freezing does not push temperature above threshold
+                 dum = dumc(i,k)*xlf/cpp
+                 if (t(i,k)+tlat(i,k)/cpp*deltat+dum.gt.233.15_r8) then
+                    dum = -(t(i,k)+tlat(i,k)/cpp*deltat-233.15_r8)*cpp/xlf
+                    dum = dum/dumc(i,k)
+                    dum = max(0._r8,dum)
+                    dum = min(1._r8,dum)
+                 else
+                    dum = 1._r8
+                 end if
+
+                 qitend(i,k)=qitend(i,k)+dum*dumc(i,k)*rdeltat
+                 ! for output
+                 homotot(i,k)=dum*dumc(i,k)*rdeltat
+
+                 ! assume 25 micron mean volume radius of homogeneously frozen droplets
+                 ! consistent with size of detrained ice in stratiform.F90
+                 nitend(i,k)=nitend(i,k)+dum*3._r8*dumc(i,k)/(4._r8*3.14_r8*1.563e-14_r8*500._r8)*rdeltat
+                 qctend(i,k)=((1._r8-dum)*dumc(i,k)-qc(i,k))*rdeltat
+                 nctend(i,k)=((1._r8-dum)*dumnc(i,k)-nc(i,k))*rdeltat
+                 tlat(i,k)=tlat(i,k)+xlf*dum*dumc(i,k)*rdeltat
+              end if
+           end if
+        end do 
+     end do 
+
+     ! remove any excess over-saturation, which is possible due to non-linearity when adding
+     ! together all microphysical processes
+     !-----------------------------------------------------------------
+     ! follow code similar to old CAM scheme
+
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           dum_2D(i,k)=q(i,k)+qvlat(i,k)*deltat
+           ttmpA(i,k)=t(i,k)+tlat(i,k)/cpp*deltat
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_startf ('micro_mg3_qsat')
+
+     ! use rhw to allow ice supersaturation
+     call qsat_water(ttmpA, p, esnA, qvnA, mgncol*nlev)
+
+     !!call t_stopf ('micro_mg3_qsat')
+
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2) private(dum,dum1)
+     do k=1,nlev
+        do i=1,mgncol
+           if (dum_2D(i,k) > qvnA(i,k) .and. qvnA(i,k) > 0 .and. allow_sed_supersat) then
+              ! expression below is approximate since there may be ice deposition
+              dum = (dum_2D(i,k)-qvnA(i,k))/(1._r8+xxlv_squared*qvnA(i,k)/(cpp*rv*ttmpA(i,k)**2))*rdeltat
+              ! add to output cme
+              cmeout(i,k) = cmeout(i,k)+dum
+              ! now add to tendencies, partition between liquid and ice based on temperature
+              if (ttmpA(i,k) > 268.15_r8) then
+                 dum1=0.0_r8
+                 ! now add to tendencies, partition between liquid and ice based on te
+                 !-------------------------------------------------------
+              else if (ttmpA(i,k) < 238.15_r8) then
+                 dum1=1.0_r8
+              else
+                 dum1=(268.15_r8-ttmpA(i,k))/30._r8
+              end if
+
+              dum = (dum_2D(i,k)-qvnA(i,k))/(1._r8+(xxls*dum1+xxlv*(1._r8-dum1))**2 &
+                    *qvnA(i,k)/(cpp*rv*ttmpA(i,k)**2))*rdeltat
+              qctend(i,k)=qctend(i,k)+dum*(1._r8-dum1)
+              ! for output
+              qcrestot(i,k)=dum*(1._r8-dum1)
+              qitend(i,k)=qitend(i,k)+dum*dum1
+              qirestot(i,k)=dum*dum1
+              qvlat(i,k)=qvlat(i,k)-dum
+              ! for output
+              qvres(i,k)=-dum
+              tlat(i,k)=tlat(i,k)+dum*(1._r8-dum1)*xxlv+dum*dum1*xxls
+           end if
+        end do 
+     end do 
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+
+  end if
+
+  ! calculate effective radius for pass to radiation code
+  !=========================================================
+  ! if no cloud water, default value is 10 micron for droplets,
+  ! 25 micron for cloud ice
+
+  ! update cloud variables after instantaneous processes to get effective radius
+  ! variables are in-cloud to calculate size dist parameters
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dumc(i,k) = max(qc(i,k)+qctend(i,k)*deltat,0._r8)/lcldm(i,k)
+        dumi(i,k) = max(qi(i,k)+qitend(i,k)*deltat,0._r8)/icldm(i,k)
+        dumnc(i,k) = max(nc(i,k)+nctend(i,k)*deltat,0._r8)/lcldm(i,k)
+        dumni(i,k) = max(ni(i,k)+nitend(i,k)*deltat,0._r8)/icldm(i,k)
+
+        dumr(i,k) = max(qr(i,k)+qrtend(i,k)*deltat,0._r8)/precip_frac(i,k)
+        dumnr(i,k) = max(nr(i,k)+nrtend(i,k)*deltat,0._r8)/precip_frac(i,k)
+        dums(i,k) = max(qs(i,k)+qstend(i,k)*deltat,0._r8)/precip_frac(i,k)
+        dumns(i,k) = max(ns(i,k)+nstend(i,k)*deltat,0._r8)/precip_frac(i,k)
+        dumg(i,k) = max(qg(i,k)+qgtend(i,k)*deltat,0._r8)
+        dumng(i,k) = max(ng(i,k)+ngtend(i,k)*deltat,0._r8)
+
+        ! switch for specification of droplet and crystal number
+        if (nccons) then
+           dumnc(i,k)=ncnst/rho(i,k)
+        end if
+
+        ! switch for specification of cloud ice number
+        if (nicons) then
+           dumni(i,k)=ninst/rho(i,k)
+        end if
+
+        ! switch for specification of graupel number
+        if (ngcons) then
+           dumng(i,k)=ngnst/rho(i,k)*precip_frac(i,k)
+        end if
+
+        ! limit in-cloud mixing ratio to reasonable value of 5 g kg-1
+        dumc(i,k)=min(dumc(i,k),5.e-3_r8)
+        dumi(i,k)=min(dumi(i,k),5.e-3_r8)
+        ! limit in-precip mixing ratios
+        dumr(i,k)=min(dumr(i,k),10.e-3_r8)
+        dums(i,k)=min(dums(i,k),10.e-3_r8)
+        dumg(i,k)=min(dumg(i,k),10.e-3_r8)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  ! cloud ice effective radius
+  !-----------------------------------------------------------------
+
+  if (do_cldice) then
+
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           dum_2D(i,k) = dumni(i,k)
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+
+     !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+     call size_dist_param_basic_vect(mg_ice_props, dumi, dumni, lami, mgncol*nlev, n0=dumni0A2D)
+
+     !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !$acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           if (dumi(i,k).ge.qsmall) then
+              if (dumni(i,k) /= dum_2D(i,k)) then
+                 ! adjust number conc if needed to keep mean size in reasonable range
+                 nitend(i,k)=(dumni(i,k)*icldm(i,k)-ni(i,k))*rdeltat
+              end if
+              effi(i,k) = 1.5_r8/lami(i,k)*1.e6_r8
+              sadice(i,k) = 2._r8*pi*(lami(i,k)**(-3))*dumni0A2D(i,k)*rho(i,k)*1.e-2_r8  ! m2/m3 -> cm2/cm3
+           else
+              effi(i,k) = 25._r8
+              sadice(i,k) = 0._r8
+           end if
+
+           ! ice effective diameter for david mitchell's optics
+           deffi(i,k)=effi(i,k)*rhoi/rhows*2._r8
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  else
+     !!call t_startf ('micro_mg3_misc')
+
+     !$acc parallel vector_length(VLEN) default(present)
+     !acc loop gang vector collapse(2)
+     do k=1,nlev
+        do i=1,mgncol
+           ! NOTE: If CARMA is doing the ice microphysics, then the ice effective
+           ! radius has already been determined from the size distribution.
+           effi(i,k) = re_ice(i,k) * 1.e6_r8      ! m -> um
+           deffi(i,k)=effi(i,k) * 2._r8
+           sadice(i,k) = 4._r8*pi*(effi(i,k)**2)*ni(i,k)*rho(i,k)*1e-2_r8
+        end do
+     end do
+     !$acc end parallel
+
+     !!call t_stopf ('micro_mg3_misc')
+  end if
+
+  !!call t_startf ('micro_mg3_misc')
+
+  ! cloud droplet effective radius
+  !-----------------------------------------------------------------
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dum_2D(i,k) = dumnc(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !!call t_startf ('micro_mg3_size_dist_param_liq_vect')
+
+  call size_dist_param_liq_vect(mg_liq_props, dumc, dumnc, rho, pgam, lamc, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_liq_vect')
+
+  !!call t_startf ('micro_mg3_misc')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (dumc(i,k).ge.qsmall) then
+
+           ! switch for specification of droplet and crystal number
+           if (nccons) then
+              ! make sure nc is consistence with the constant N by adjusting tendency, need
+              ! to multiply by cloud fraction
+              ! note that nctend may be further adjusted below if mean droplet size is
+              ! out of bounds
+              nctend(i,k)=(ncnst/rho(i,k)*lcldm(i,k)-nc(i,k))*rdeltat
+           end if
+
+           if (dum_2D(i,k) /= dumnc(i,k)) then
+              ! adjust number conc if needed to keep mean size in reasonable range
+              nctend(i,k)=(dumnc(i,k)*lcldm(i,k)-nc(i,k))*rdeltat
+           end if
+
+           effc(i,k) = (pgam(i,k)+3._r8)/lamc(i,k)/2._r8*1.e6_r8
+           !assign output fields for shape here
+           lamcrad(i,k)=lamc(i,k)
+           pgamrad(i,k)=pgam(i,k)
+
+           ! recalculate effective radius for constant number, in order to separate
+           ! first and second indirect effects
+           !======================================
+           ! assume constant number of 10^8 kg-1
+           dumnc(i,k)=1.e8_r8
+
+        end if
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_stopf ('micro_mg3_misc')
+
+  !!call t_startf ('micro_mg3_size_dist_param_liq_vect')
+
+  ! Pass in "false" adjust flag to prevent number from being changed within
+  ! size distribution subroutine.
+  call size_dist_param_liq_vect(mg_liq_props, dumc, dumnc, rho, pgam, lamc, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_liq_vect')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k =1,nlev
+     do i=1,mgncol
+        if (dumc(i,k).ge.qsmall) then
+           effc_fn(i,k) = (pgam(i,k)+3._r8)/lamc(i,k)/2._r8*1.e6_r8
+        else
+           effc(i,k) = 10._r8
+           lamcrad(i,k)=0._r8
+           pgamrad(i,k)=0._r8
+           effc_fn(i,k) = 10._r8
+        end if
+     end do
+  end do
+
+  ! recalculate 'final' rain size distribution parameters
+  ! to ensure that rain size is in bounds, adjust rain number if needed
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dum_2D(i,k) = dumnr(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  call size_dist_param_basic_vect(mg_rain_props, dumr, dumnr, lamr, mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (dumr(i,k).ge.qsmall) then
+           if (dum_2D(i,k) /= dumnr(i,k)) then
+              ! adjust number conc if needed to keep mean size in reasonable range
+              nrtend(i,k)=(dumnr(i,k)*precip_frac(i,k)-nr(i,k))*rdeltat
+           end if
+        end if
+     end do
+  end do
+
+  ! recalculate 'final' snow size distribution parameters
+  ! to ensure that snow size is in bounds, adjust snow number if needed
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dum_2D(i,k) = dumns(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  call size_dist_param_basic_vect(mg_snow_props, dums, dumns, lams, mgncol*nlev, n0=dumns0A2D)
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !$acc parallel vector_length(VLEN) default(present) 
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (dums(i,k).ge.qsmall) then
+           if (dum_2D(i,k) /= dumns(i,k)) then
+              ! adjust number conc if needed to keep mean size in reasonable range
+              nstend(i,k)=(dumns(i,k)*precip_frac(i,k)-ns(i,k))*rdeltat
+           end if
+           sadsnow(i,k) = 2._r8*pi*(lams(i,k)**(-3))*dumns0A2D(i,k)*rho(i,k)*1.e-2_r8  ! m2/m3 -> cm2/cm3
+        end if
+     end do ! vertical k loop
+  end do
+
+  ! recalculate 'final' graupel size distribution parameters
+  ! to ensure that  size is in bounds, addjust number if needed
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        dum_2D(i,k) = dumng(i,k)
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_size_dist_param_basic_vect')
+
+  if (do_hail) then
+     call size_dist_param_basic_vect(mg_hail_props, dumg, dumng, lamg, mgncol*nlev)
+  end if
+  if (do_graupel) then
+     call size_dist_param_basic_vect(mg_graupel_props, dumg, dumng, lamg, mgncol*nlev)
+  end if
+
+  !!call t_stopf ('micro_mg3_size_dist_param_basic_vect')
+
+  !$acc parallel vector_length(VLEN) default(present) 
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (dumg(i,k).ge.qsmall) then
+           if (dum_2D(i,k) /= dumng(i,k)) then
+              ! adjust number conc if needed to keep mean size in reasonable range
+              ngtend(i,k)=(dumng(i,k)*precip_frac(i,k)-ng(i,k))*rdeltat
+           end if
+        end if
+     end do
+  end do
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        ! if updated q (after microphysics) is zero, then ensure updated n is also zero
+        !=================================================================================
+        if (qc(i,k)+qctend(i,k)*deltat.lt.qsmall) nctend(i,k)=-nc(i,k)*rdeltat
+        if (do_cldice .and. qi(i,k)+qitend(i,k)*deltat.lt.qsmall) nitend(i,k)=-ni(i,k)*rdeltat
+        if (qr(i,k)+qrtend(i,k)*deltat.lt.qsmall) nrtend(i,k)=-nr(i,k)*rdeltat
+        if (qs(i,k)+qstend(i,k)*deltat.lt.qsmall) nstend(i,k)=-ns(i,k)*rdeltat
+        if (qg(i,k)+qgtend(i,k)*deltat.lt.qsmall) ngtend(i,k)=-ng(i,k)*rdeltat
+
+        ! DO STUFF FOR OUTPUT:
+        !==================================================
+      
+        ! qc and qi are only used for output calculations past here,
+        ! so add qctend and qitend back in one more time
+        qc(i,k) = qc(i,k) + qctend(i,k)*deltat
+        qi(i,k) = qi(i,k) + qitend(i,k)*deltat
+     end do
+  end do
+
+  ! averaging for snow and rain number and diameter
+  !--------------------------------------------------
+
+  ! drout2/dsout2:
+  ! diameter of rain and snow
+  ! dsout:
+  ! scaled diameter of snow (passed to radiation in CAM)
+  ! reff_rain/reff_snow:
+  ! calculate effective radius of rain and snow in microns for COSP using Eq. 9 of COSP v1.3 manual
+
+  ! avoid divide by zero in avg_diameter_vec
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (nrout(i,k) .eq. 0._r8) nrout(i,k)=1.e-34_r8
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_avg_diameter_vec')
+
+  ! The avg_diameter_vec call does the actual calculation; other diameter
+  ! outputs are just drout2 times constants.
+  call avg_diameter_vec(qrout,nrout,rho,rhow,drout2,mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_avg_diameter_vec')
+
+  !$acc parallel vector_length(VLEN) default(present) 
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (qrout(i,k) .gt. 1.e-7_r8 .and. nrout(i,k) .gt. 0._r8) then
+           qrout2(i,k) = qrout(i,k) * precip_frac(i,k)
+           nrout2(i,k) = nrout(i,k) * precip_frac(i,k)
+           freqr(i,k) = precip_frac(i,k)
+           reff_rain(i,k)=1.5_r8*drout2(i,k)*1.e6_r8
+        else
+           qrout2(i,k) = 0._r8
+           nrout2(i,k) = 0._r8
+           drout2(i,k) = 0._r8
+           freqr(i,k) = 0._r8
+           reff_rain(i,k) = 0._r8
+        end if
+    end do
+  end do
+
+  ! avoid divide by zero in avg_diameter_vec
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (nsout(i,k) .eq. 0._r8) nsout(i,k) = 1.e-34_r8
+     end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_avg_diameter_vec')
+
+  ! The avg_diameter_vec call does the actual calculation; other diameter
+  ! outputs are just dsout2 times constants.
+  call avg_diameter_vec(qsout, nsout, rho, rhosn,dsout2,mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_avg_diameter_vec')
+
+  !$acc parallel vector_length(VLEN) default(present) 
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (qsout(i,k) .gt. 1.e-7_r8 .and. nsout(i,k) .gt. 0._r8) then
+           qsout2(i,k) = qsout(i,k) * precip_frac(i,k)
+           nsout2(i,k) = nsout(i,k) * precip_frac(i,k)
+           freqs(i,k) = precip_frac(i,k)
+           dsout(i,k)=3._r8*rhosn/rhows*dsout2(i,k)
+           reff_snow(i,k)=1.5_r8*dsout2(i,k)*1.e6_r8
+        else
+           dsout(i,k)  = 0._r8
+           qsout2(i,k) = 0._r8
+           nsout2(i,k) = 0._r8
+           dsout2(i,k) = 0._r8
+           freqs(i,k)  = 0._r8
+           reff_snow(i,k)=0._r8
+        end if 
+    end do
+  end do
+
+  ! avoid divide by zero in avg_diameter_vec
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (ngout(i,k) .eq. 0._r8) ngout(i,k) = 1.e-34_r8
+    end do
+  end do
+  !$acc end parallel
+
+  !!call t_startf ('micro_mg3_avg_diameter_vec')
+
+  ! The avg_diameter_vec call does the actual calculation; other diameter
+  ! outputs are just dsout2 times constants.
+  call avg_diameter_vec(qgout, ngout, rho, rhogtmp,dgout2,mgncol*nlev)
+
+  !!call t_stopf ('micro_mg3_avg_diameter_vec')
+
+  !$acc parallel vector_length(VLEN) default(present) 
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+     do i=1,mgncol
+        if (qgout(i,k) .gt. 1.e-7_r8 .and. ngout(i,k) .gt. 0._r8) then
+           qgout2(i,k) = qgout(i,k) * precip_frac(i,k)
+           ngout2(i,k) = ngout(i,k) * precip_frac(i,k)
+           freqg(i,k) = precip_frac(i,k)
+           dgout(i,k)=3._r8*rhogtmp/rhows*dgout2(i,k)
+           reff_grau(i,k)=1.5_r8*dgout2(i,k)*1.e6_r8
+        else
+           dgout(i,k)  = 0._r8
+           qgout2(i,k) = 0._r8
+           ngout2(i,k) = 0._r8
+           dgout2(i,k) = 0._r8
+           freqg(i,k)  = 0._r8
+           reff_grau(i,k)=0._r8
+        end if 
+    end do
+  end do
+
+  ! analytic radar reflectivity
+  !--------------------------------------------------
+  ! formulas from Matthew Shupe, NOAA/CERES
+  ! *****note: radar reflectivity is local (in-precip average)
+  ! units of mm^6/m^3
+
+  !$acc loop gang vector collapse(2) private(dum,dum1)
+  do k=1,nlev
+     do i = 1,mgncol
+        if (qc(i,k).ge.qsmall .and. (nc(i,k)+nctend(i,k)*deltat).gt.10._r8) then
+           dum=(qc(i,k)/lcldm(i,k)*rho(i,k)*1000._r8)**2 &
+                /(0.109_r8*(nc(i,k)+nctend(i,k)*deltat)/lcldm(i,k)*rho(i,k)/1.e6_r8)*lcldm(i,k)/precip_frac(i,k)
+        else
+           dum=0._r8
+        end if
+        if (qi(i,k).ge.qsmall) then
+           dum1=(qi(i,k)*rho(i,k)/icldm(i,k)*1000._r8/0.1_r8)**(1._r8/0.63_r8)*icldm(i,k)/precip_frac(i,k)
+        else
+           dum1=0._r8
+        end if
+
+        if (qsout(i,k).ge.qsmall) then
+           dum1=dum1+(qsout(i,k)*rho(i,k)*1000._r8/0.1_r8)**(1._r8/0.63_r8)
+        end if
+
+        refl(i,k)=dum+dum1
+
+        ! add rain rate, but for 37 GHz formulation instead of 94 GHz
+        ! formula approximated from data of Matrasov (2007)
+        ! rainrt is the rain rate in mm/hr
+        ! reflectivity (dum) is in DBz
+
+        if (rainrt(i,k).ge.0.001_r8) then
+           dum=log10(rainrt(i,k)**6._r8)+16._r8
+
+           ! convert from DBz to mm^6/m^3
+
+           dum = 10._r8**(dum/10._r8)
+        else
+           ! don't include rain rate in R calculation for values less than 0.001 mm/hr
+           dum=0._r8
+        end if
+
+        ! add to refl
+        refl(i,k)=refl(i,k)+dum
+
+        !output reflectivity in Z.
+        areflz(i,k)=refl(i,k) * precip_frac(i,k)
+
+        ! convert back to DBz
+        if (refl(i,k).gt.minrefl) then
+           refl(i,k)=10._r8*log10(refl(i,k))
+        else
+           refl(i,k)=-9999._r8
+        end if
+
+        !set averaging flag
+        if (refl(i,k).gt.mindbz) then
+           arefl(i,k)=refl(i,k) * precip_frac(i,k)
+           frefl(i,k)=precip_frac(i,k)
+        else
+           arefl(i,k)=0._r8
+           areflz(i,k)=0._r8
+           frefl(i,k)=0._r8
+        end if
+
+        ! bound cloudsat reflectivity
+        csrfl(i,k)=min(csmax,refl(i,k))
+
+        !set averaging flag
+        if (csrfl(i,k).gt.csmin) then
+           acsrfl(i,k)=refl(i,k) * precip_frac(i,k)
+           fcsrfl(i,k)=precip_frac(i,k)
+        else
+           acsrfl(i,k)=0._r8
+           fcsrfl(i,k)=0._r8
+        end if
+
+     end do
+  end do
+
+  !redefine fice here....
+
+  !$acc loop gang vector collapse(2)
+  do k=1,nlev
+    do i=1,mgncol
+       dum_2D(i,k) = qsout(i,k) + qrout(i,k) + qc(i,k) + qi(i,k)
+       dumi(i,k) = qsout(i,k) + qi(i,k)
+       if (dumi(i,k) .gt. qsmall .and. dum_2D(i,k) .gt. qsmall) then
+          nfice(i,k)=min(dumi(i,k)/dum_2D(i,k),1._r8)
+       else
+          nfice(i,k)=0._r8
+       end if
+     end do
+  end do
+  !$acc end parallel
+
+!$acc end data 
+
+end subroutine micro_mg_tend
+
+!========================================================================
+!OUTPUT CALCULATIONS
+!========================================================================
+
+subroutine calc_rercld(lamr, n0r, lamc, pgam, qric, qcic, ncic, rercld, vlen)
+  integer, intent(in) :: vlen 
+  real(r8), dimension(vlen), intent(in) :: lamr          ! rain size parameter (slope)
+  real(r8), dimension(vlen), intent(in) :: n0r           ! rain size parameter (intercept)
+  real(r8), dimension(vlen), intent(in) :: lamc          ! size distribution parameter (slope)
+  real(r8), dimension(vlen), intent(in) :: pgam          ! droplet size parameter
+  real(r8), dimension(vlen), intent(in) :: qric          ! in-cloud rain mass mixing ratio
+  real(r8), dimension(vlen), intent(in) :: qcic          ! in-cloud cloud liquid
+  real(r8), dimension(vlen), intent(in) :: ncic          ! in-cloud droplet number concentration
+
+  real(r8), dimension(vlen), intent(inout) :: rercld     ! effective radius calculation for rain + cloud
+
+  ! combined size of precip & cloud drops
+  real(r8) :: Atmp(vlen),tmp(vlen), pgamp1(vlen)
+
+  integer :: i
+
+  !$acc data present (rercld,lamr,n0r,lamc,pgam,qric,qcic,ncic) &
+  !$acc      create  (Atmp,tmp,pgamp1)
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector
+  do i=1,vlen
+     pgamp1(i) = pgam(i)+1._r8
+  end do
+  !$acc end parallel
+
+  call rising_factorial(pgamp1, 2, tmp, vlen)
+
+  !$acc parallel vector_length(VLEN) default(present)
+  !$acc loop gang vector
+  do i=1,vlen
+     ! Rain drops
+     if (lamr(i) > 0._r8) then
+        Atmp(i) = n0r(i) * pi / (2._r8 * lamr(i)**3._r8)
+     else
+        Atmp(i) = 0._r8
+     end if
+
+     ! Add cloud drops
+     if (lamc(i) > 0._r8) then
+        Atmp(i) = Atmp(i) + &
+             ncic(i) * pi * tmp(i)/(4._r8 * lamc(i)**2._r8)
+     end if
+
+     if (Atmp(i) > 0._r8) then
+        rercld(i) = rercld(i) + 3._r8 *(qric(i) + qcic(i)) / (4._r8 * rhow * Atmp(i))
+     end if
+  end do
+  !$acc end parallel
+
+  !$acc end data
+end subroutine calc_rercld
+
+!========================================================================
+!2020-09-15: Follow John Dennis's version to generate a new interface 
+!            to update tendency in the sedimentation loop
+!========================================================================
+subroutine Sedimentation(mgncol,nlev,do_cldice,deltat,fx,fnx,pdel_inv,qxtend,nxtend, &
+                         qxsedten,dumx,dumnx,prect,xflx,xxlx,qxsevap,xcldm,tlat,qvlat,preci)
+
+   integer, intent(in)               :: mgncol,nlev
+   logical, intent(in)               :: do_cldice
+   real(r8),intent(in)               :: deltat
+   real(r8), intent(in)              :: fx(mgncol,nlev)
+   real(r8), intent(in)              :: fnx(mgncol,nlev)
+   real(r8), intent(in)              :: pdel_inv(mgncol,nlev)
+   real(r8), intent(inout)           :: qxtend(mgncol,nlev)
+   real(r8), intent(inout)           :: nxtend(mgncol,nlev)
+   real(r8), intent(inout)           :: qxsedten(mgncol,nlev)
+   real(r8), intent(inout)           :: dumx(mgncol,nlev)
+   real(r8), intent(inout)           :: dumnx(mgncol,nlev)
+   real(r8), intent(inout)           :: prect(mgncol)
+   real(r8), intent(inout)           :: xflx(mgncol,nlev+1)
+   real(r8), intent(in)   , optional :: xxlx
+   real(r8), intent(inout), optional :: qxsevap(mgncol,nlev)
+   real(r8), intent(in)   , optional :: xcldm(mgncol,nlev)
+   real(r8), intent(inout), optional :: tlat(mgncol,nlev)
+   real(r8), intent(inout), optional :: qvlat(mgncol,nlev)
+   real(r8), intent(inout), optional :: preci(mgncol)
+   integer  :: i,k,n,nstep,nstepMax
+   real(r8) :: faltndx(mgncol,nlev),faltndnx(mgncol,nlev),faltndqxe2(mgncol,nlev)
+   real(r8) :: faloutx(mgncol,nlev),faloutnx(mgncol,nlev),dum1(mgncol,nlev),dum_2D(mgncol,nlev)
+   real(r8) :: rnstep(mgncol),mask(mgncol)
+   integer  :: iters(mgncol)
+   logical  :: present_tlat,present_qvlat, present_xcldm,present_qxsevap, present_preci
+
+   present_tlat    = present(tlat)
+   present_qvlat   = present(qvlat)
+   present_xcldm   = present(xcldm)
+   present_qxsevap = present(qxsevap)
+   present_preci   = present(preci)
+
+   ! loop over sedimentation sub-time step to ensure stability
+   !==============================================================
+
+   !$acc data present (fx,fnx,pdel_inv,qxtend,nxtend,qxsedten,dumx,dumnx) &
+   !$acc      present (prect,xflx,xxlx,qxsevap,xcldm,tlat,qvlat,preci) &
+   !$acc      create  (iters,rnstep,faltndx,faltndnx,faloutx,faloutnx,faltndqxe2,mask,dum1,dum_2D)
+
+   !$acc parallel vector_length(VLEN) default(present)
+   !$acc loop gang vector
+   do k = 1, nlev
+      do i = 1, mgncol
+         dum_2D(i,k) = max( fx(i,k)*pdel_inv(i,k), fnx(i,k)*pdel_inv(i,k) )
+      end do
+   end do
+   !$acc end parallel
+
+   !$acc parallel vector_length(VLEN) default(present)
+   !$acc loop gang vector private(n,k)
+   do i = 1,mgncol
+      iters(i)  = 1 + int( maxval( dum_2D(i,:) * deltat ) )
+      rnstep(i) = 1._r8/real(iters(i))
+
+      do n = 1, iters(i)
+        !---------------------------------------------
+        ! mask out any additional changes to points 
+        ! that should have already converged. 
+        ! This code modification makes this 
+        ! reproduces existing answer
+        !---------------------------------------------
+        if (n > iters(i)) then
+           mask(i)=0._r8
+        else
+           mask(i)=1._r8
+        end if
+
+        if (do_cldice) then
+           do k=1,nlev
+              faloutx(i,k)  = fx(i,k)  * dumx(i,k)  * mask(i)
+              faloutnx(i,k) = fnx(i,k) * dumnx(i,k) * mask(i)
+           end do
+        else
+           do k=1,nlev
+              faloutx(i,k)  = 0._r8
+              faloutnx(i,k) = 0._r8
+           end do
+        end if
+
+        ! top of model
+        k = 1
+
+        ! add fallout terms to microphysical tendencies
+        faltndx(i,k)  = faloutx(i,k)*pdel_inv(i,k)
+        faltndnx(i,k) = faloutnx(i,k)*pdel_inv(i,k)
+        qxtend(i,k)   = qxtend(i,k)-faltndx(i,k)*rnstep(i)
+        nxtend(i,k)   = nxtend(i,k)-faltndnx(i,k)*rnstep(i)
+        ! sedimentation tendency for output
+
+        qxsedten(i,k) = qxsedten(i,k)-faltndx(i,k)*rnstep(i)
+        dumx(i,k)     = dumx(i,k)-faltndx(i,k)*deltat*rnstep(i)
+        dumnx(i,k)    = dumnx(i,k)-faltndnx(i,k)*deltat*rnstep(i)
+
+        !$acc loop vector
+        do k = 2, nlev
+           if(present_xcldm) then
+              dum1(i,k) = xcldm(i,k)/xcldm(i,k-1)
+              dum1(i,k) = min(dum1(i,k),1._r8)
+           else
+              dum1(i,k) = 1._r8
+           end if
+           ! for cloud liquid and ice, if cloud fraction increases with height
+           ! then add flux from above to both vapor and cloud water of current level
+           ! this means that flux entering clear portion of cell from above evaporates
+           ! instantly
+           ! note: this is not an issue with precip, since we assume max overlap
+           faltndx(i,k)    = (faloutx(i,k)  - dum1(i,k)*faloutx(i,k-1))*pdel_inv(i,k)
+           faltndnx(i,k)   = (faloutnx(i,k) - dum1(i,k)*faloutnx(i,k-1))*pdel_inv(i,k)
+           faltndqxe2(i,k) = (dum1(i,k)-1._r8)*faloutx(i,k-1)*pdel_inv(i,k)
+
+           ! add fallout terms to eulerian tendencies
+           qxtend(i,k)     = qxtend(i,k)-faltndx(i,k)*rnstep(i)
+           nxtend(i,k)     = nxtend(i,k)-faltndnx(i,k)*rnstep(i)
+           ! sedimentation tendency for output
+           qxsedten(i,k)   = qxsedten(i,k)-faltndx(i,k)*rnstep(i)
+           ! add terms to to evap/sub of cloud water
+
+           ! for output
+           if (present_qxsevap) then
+              qxsevap(i,k) = qxsevap(i,k)- faltndqxe2(i,k)*rnstep(i)
+           end if
+           if (present_qvlat) then
+              qvlat(i,k)   = qvlat(i,k)-faltndqxe2(i,k)*rnstep(i)
+           end if
+           if(present_tlat) then
+              tlat(i,k)    = tlat(i,k)+faltndqxe2(i,k)*xxlx*rnstep(i)
+           end if
+           dumx(i,k)       = dumx(i,k)-faltndx(i,k)*deltat*rnstep(i)
+           dumnx(i,k)      = dumnx(i,k)-faltndnx(i,k)*deltat*rnstep(i)
+         end do
+
+        !$acc loop vector
+         do k = 1,nlev
+            xflx(i,k+1) = xflx(i,k+1) + faloutx(i,k) / g * rnstep(i)
+         end do
+   
+         ! units below are m/s
+         ! sedimentation flux at surface is added to precip flux at surface
+         ! to get total precip (cloud + precip water) rate
+         prect(i) = prect(i)+faloutx(i,nlev)/g*rnstep(i)/1000._r8
+
+         if (present_preci) preci(i) = preci(i)+faloutx(i,nlev)/g*rnstep(i)/1000._r8
+
+      end do  ! n loop of 1, nstep
+
+   end do     ! i loop of 1, mgncol
+   !$acc end parallel
+
+   !$acc end data
+end subroutine Sedimentation
+
+!========================================================================
+!UTILITIES
+!========================================================================
+
+
+pure subroutine micro_mg_get_cols(ncol, nlev, top_lev, mgncol, mgcols, &
+     qcn, qin, qrn, qsn, qgr)
+
+  ! Determines which columns microphysics should operate over by
+  ! checking for non-zero cloud water/ice.
+
+  integer, intent(in) :: ncol      ! Number of columns with meaningful data
+  integer, intent(in) :: nlev      ! Number of levels to use
+  integer, intent(in) :: top_lev   ! Top level for microphysics
+  integer, intent(out) :: mgncol   ! Number of columns MG will use
+  integer, allocatable, intent(out) :: mgcols(:) ! column indices
+
+  real(r8), intent(in) :: qcn(:,:) ! cloud water mixing ratio (kg/kg)
+  real(r8), intent(in) :: qin(:,:) ! cloud ice mixing ratio (kg/kg)
+  real(r8), intent(in) :: qrn(:,:) ! rain mixing ratio (kg/kg)
+  real(r8), intent(in) :: qsn(:,:) ! snow mixing ratio (kg/kg)
+  real(r8), optional, intent(in) :: qgr(:,:) ! graupel mixing ratio (kg/kg)
+
+  integer :: lev_offset  ! top_lev - 1 (defined here for consistency)
+  logical :: ltrue(ncol) ! store tests for each column
+
+  integer :: i, ii ! column indices
+
+  if (allocated(mgcols)) deallocate(mgcols)
+
+  lev_offset = top_lev - 1
+
+  ! Using "any" along dimension 2 collapses across levels, but
+  ! not columns, so we know if water is present at any level
+  ! in each column.
+
+  ltrue = any(qcn(:ncol,top_lev:(nlev+lev_offset)) >= qsmall, 2)
+  ltrue = ltrue .or. any(qin(:ncol,top_lev:(nlev+lev_offset)) >= qsmall, 2)
+  ltrue = ltrue .or. any(qrn(:ncol,top_lev:(nlev+lev_offset)) >= qsmall, 2)
+  ltrue = ltrue .or. any(qsn(:ncol,top_lev:(nlev+lev_offset)) >= qsmall, 2)
+
+  if(present(qgr)) ltrue = ltrue .or. any(qgr(:ncol,top_lev:(nlev+lev_offset)) >= qsmall, 2)
+
+  ! Scan for true values to get a usable list of indices.
+
+  mgncol = count(ltrue)
+  allocate(mgcols(mgncol))
+  i = 0
+  do ii = 1,ncol
+     if (ltrue(ii)) then
+        i = i + 1
+        mgcols(i) = ii
+     end if
+  end do
+
+end subroutine micro_mg_get_cols
+
+end module micro_mg3_0
